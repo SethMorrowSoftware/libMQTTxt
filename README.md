@@ -1,4 +1,4 @@
-# libMQTTxt# MQTT Client Library for LiveCode
+# libMQTTxt MQTT Client Library for LiveCode
 
 A pure LiveCode implementation of MQTT 3.1.1 protocol client with full QoS support, TLS encryption, and automatic reconnection.
 
