@@ -1,6 +1,6 @@
 # MQTT Client Library Reference
 
-Version 2.11.8 - LiveCode MQTT 3.1.1 Implementation
+Version 2.11.8 - OXT MQTT 3.1.1 Implementation
 
 ## Table of Contents
 
@@ -20,7 +20,7 @@ Version 2.11.8 - LiveCode MQTT 3.1.1 Implementation
 
 Load the library in your stack script:
 
-```livecode
+```OXT
 on preOpenStack
    start using stack "script_only_stack_"
 end preOpenStack
@@ -36,7 +36,7 @@ The library must be in `stacksInUse` for socket callbacks to function correctly.
 
 Set the target object for all callbacks.
 
-```livecode
+```OXT
 mqttSetCallbackTarget pTarget
 ```
 
@@ -44,7 +44,7 @@ mqttSetCallbackTarget pTarget
 - `pTarget` - Long ID of target object (typically `the long id of this card`)
 
 **Example:**
-```livecode
+```OXT
 mqttSetCallbackTarget the long id of this card
 ```
 
@@ -54,7 +54,7 @@ mqttSetCallbackTarget the long id of this card
 
 Define the handler name for incoming messages.
 
-```livecode
+```OXT
 mqttSetMessageCallback pHandlerName
 ```
 
@@ -62,7 +62,7 @@ mqttSetMessageCallback pHandlerName
 - `pHandlerName` - Name of message handler in callback target
 
 **Example:**
-```livecode
+```OXT
 mqttSetMessageCallback "onMQTTMessage"
 
 -- Handler in callback target:
@@ -77,7 +77,7 @@ end onMQTTMessage
 
 Define the handler name for log messages.
 
-```livecode
+```OXT
 mqttSetLogCallback pHandlerName
 ```
 
@@ -85,7 +85,7 @@ mqttSetLogCallback pHandlerName
 - `pHandlerName` - Name of log handler in callback target
 
 **Example:**
-```livecode
+```OXT
 mqttSetLogCallback "onMQTTLog"
 
 on onMQTTLog pMessage
@@ -99,7 +99,7 @@ end onMQTTLog
 
 Define the handler name for connection state changes.
 
-```livecode
+```OXT
 mqttSetStateChangeCallback pHandlerName
 ```
 
@@ -107,7 +107,7 @@ mqttSetStateChangeCallback pHandlerName
 - `pHandlerName` - Name of state change handler
 
 **Example:**
-```livecode
+```OXT
 mqttSetStateChangeCallback "onStateChange"
 
 on onStateChange pState, pHost, pPort, pReason
@@ -123,7 +123,7 @@ end onStateChange
 
 Define the handler name for reconnection events.
 
-```livecode
+```OXT
 mqttSetReconnectCallback pHandlerName
 ```
 
@@ -131,7 +131,7 @@ mqttSetReconnectCallback pHandlerName
 - `pHandlerName` - Name of reconnect handler
 
 **Example:**
-```livecode
+```OXT
 mqttSetReconnectCallback "onReconnect"
 
 on onReconnect pEvent, pHost, pPort, pAttempts
@@ -147,7 +147,7 @@ end onReconnect
 
 Enable or disable debug logging.
 
-```livecode
+```OXT
 mqttSetDebugMode pDebug
 ```
 
@@ -155,7 +155,7 @@ mqttSetDebugMode pDebug
 - `pDebug` - Boolean (true/false)
 
 **Example:**
-```livecode
+```OXT
 mqttSetDebugMode true
 ```
 
@@ -165,7 +165,7 @@ mqttSetDebugMode true
 
 Suppress all logging output.
 
-```livecode
+```OXT
 mqttSetQuietMode pQuiet
 ```
 
@@ -173,7 +173,7 @@ mqttSetQuietMode pQuiet
 - `pQuiet` - Boolean (true/false)
 
 **Example:**
-```livecode
+```OXT
 mqttSetQuietMode false
 ```
 
@@ -183,7 +183,7 @@ mqttSetQuietMode false
 
 Set when to send PINGREQ as percentage of keep-alive interval.
 
-```livecode
+```OXT
 mqttSetKeepAliveThreshold pThreshold
 ```
 
@@ -191,7 +191,7 @@ mqttSetKeepAliveThreshold pThreshold
 - `pThreshold` - Decimal between 0 and 1 (default 0.75 = 75%)
 
 **Example:**
-```livecode
+```OXT
 mqttSetKeepAliveThreshold 0.75
 ```
 
@@ -201,14 +201,14 @@ mqttSetKeepAliveThreshold 0.75
 
 Get current keep-alive threshold.
 
-```livecode
+```OXT
 function mqttGetKeepAliveThreshold()
 ```
 
 **Returns:** Decimal between 0 and 1
 
 **Example:**
-```livecode
+```OXT
 put mqttGetKeepAliveThreshold() into tThreshold
 ```
 
@@ -218,7 +218,7 @@ put mqttGetKeepAliveThreshold() into tThreshold
 
 Set maximum receive buffer size in bytes.
 
-```livecode
+```OXT
 mqttSetMaxBufferSize pBytes
 ```
 
@@ -226,7 +226,7 @@ mqttSetMaxBufferSize pBytes
 - `pBytes` - Integer (minimum 65536, maximum 268435455)
 
 **Example:**
-```livecode
+```OXT
 mqttSetMaxBufferSize 5242880  -- 5MB
 ```
 
@@ -236,7 +236,7 @@ mqttSetMaxBufferSize 5242880  -- 5MB
 
 Enable persistent storage for QoS 1/2 messages.
 
-```livecode
+```OXT
 mqttSetPersistentStore pEnabled, pStorePath
 ```
 
@@ -245,7 +245,7 @@ mqttSetPersistentStore pEnabled, pStorePath
 - `pStorePath` - Optional file path (default: documents/mqtt_store)
 
 **Example:**
-```livecode
+```OXT
 mqttSetPersistentStore true, specialFolderPath("documents") & "/mqtt"
 ```
 
@@ -257,7 +257,7 @@ mqttSetPersistentStore true, specialFolderPath("documents") & "/mqtt"
 
 Establish connection to MQTT broker.
 
-```livecode
+```OXT
 function mqttConnect(pHost, pPort, pClientID, pUsername, pPassword, \
                      pKeepAlive, pUseTLS, pCleanSession, pLWTTopic, \
                      pLWTMessage, pLWTQoS, pLWTRetain, pVerifyTLS, \
@@ -284,7 +284,7 @@ function mqttConnect(pHost, pPort, pClientID, pUsername, pPassword, \
 **Returns:** "OK" on success, "ERROR: message" on failure
 
 **Example:**
-```livecode
+```OXT
 put mqttConnect("broker.example.com", 8883, "client123", \
                 "user", "pass", 60, true, true, "", "", \
                 0, false, false, true, "") into tResult
@@ -302,7 +302,7 @@ end if
 
 Simplified connection with common defaults.
 
-```livecode
+```OXT
 function mqttConnectSimple(pHost, pPort, pClientID, pUsername, pPassword)
 ```
 
@@ -316,7 +316,7 @@ function mqttConnectSimple(pHost, pPort, pClientID, pUsername, pPassword)
 **Returns:** "OK" or "ERROR: message"
 
 **Example:**
-```livecode
+```OXT
 put mqttConnectSimple("broker.hivemq.com", 1883, "myClient", "", "") into tResult
 ```
 
@@ -328,7 +328,7 @@ This uses defaults: keep-alive 60s, no TLS, clean session, no LWT, no auto-recon
 
 Check if connection is active.
 
-```livecode
+```OXT
 function mqttIsConnected(pHost, pPort)
 ```
 
@@ -339,7 +339,7 @@ function mqttIsConnected(pHost, pPort)
 **Returns:** Boolean (true/false)
 
 **Example:**
-```livecode
+```OXT
 if mqttIsConnected("broker.example.com", 1883) then
    put "Connected"
 else
@@ -353,7 +353,7 @@ end if
 
 Manually reconnect to broker.
 
-```livecode
+```OXT
 function mqttReconnect(pHost, pPort)
 ```
 
@@ -364,7 +364,7 @@ function mqttReconnect(pHost, pPort)
 **Returns:** "OK" or "ERROR: message"
 
 **Example:**
-```livecode
+```OXT
 put mqttReconnect("broker.example.com", 1883) into tResult
 ```
 
@@ -374,7 +374,7 @@ put mqttReconnect("broker.example.com", 1883) into tResult
 
 Disconnect from broker.
 
-```livecode
+```OXT
 command mqttDisconnect pHost, pPort
 ```
 
@@ -383,7 +383,7 @@ command mqttDisconnect pHost, pPort
 - `pPort` - Broker port
 
 **Example:**
-```livecode
+```OXT
 mqttDisconnect "broker.example.com", 1883
 ```
 
@@ -393,12 +393,12 @@ mqttDisconnect "broker.example.com", 1883
 
 Disconnect all connections and cleanup resources.
 
-```livecode
+```OXT
 command mqttCleanupAll
 ```
 
 **Example:**
-```livecode
+```OXT
 on closeStack
    mqttCleanupAll
 end closeStack
@@ -412,7 +412,7 @@ end closeStack
 
 Publish a message to a topic.
 
-```livecode
+```OXT
 function mqttPublish(pHost, pPort, pTopic, pMessage, pQoS, pRetain)
 ```
 
@@ -432,7 +432,7 @@ function mqttPublish(pHost, pPort, pTopic, pMessage, pQoS, pRetain)
 - 2: Exactly once (assured delivery)
 
 **Example:**
-```livecode
+```OXT
 -- QoS 0 message
 put mqttPublish("broker.example.com", 1883, "sensor/temp", "23.5", 0, false) into tResult
 
@@ -456,7 +456,7 @@ put mqttPublish("broker.example.com", 1883, "device/status", "online", 0, true) 
 
 Subscribe to a topic.
 
-```livecode
+```OXT
 function mqttSubscribe(pHost, pPort, pTopic, pQoS)
 ```
 
@@ -473,7 +473,7 @@ function mqttSubscribe(pHost, pPort, pTopic, pQoS)
 - `#` - Multi-level wildcard (e.g., `sensor/#`)
 
 **Example:**
-```livecode
+```OXT
 -- Subscribe to specific topic
 put mqttSubscribe("broker.example.com", 1883, "sensor/temp", 0) into tResult
 
@@ -490,7 +490,7 @@ put mqttSubscribe("broker.example.com", 1883, "sensor/#", 1) into tResult
 
 Unsubscribe from a topic.
 
-```livecode
+```OXT
 function mqttUnsubscribe(pHost, pPort, pTopic)
 ```
 
@@ -502,7 +502,7 @@ function mqttUnsubscribe(pHost, pPort, pTopic)
 **Returns:** "OK" or "ERROR: message"
 
 **Example:**
-```livecode
+```OXT
 put mqttUnsubscribe("broker.example.com", 1883, "sensor/temp") into tResult
 ```
 
@@ -512,7 +512,7 @@ put mqttUnsubscribe("broker.example.com", 1883, "sensor/temp") into tResult
 
 Get list of active subscriptions.
 
-```livecode
+```OXT
 function mqttGetSubscriptions(pHost, pPort)
 ```
 
@@ -523,7 +523,7 @@ function mqttGetSubscriptions(pHost, pPort)
 **Returns:** Line-delimited list of subscribed topics
 
 **Example:**
-```livecode
+```OXT
 put mqttGetSubscriptions("broker.example.com", 1883) into tSubs
 repeat for each line tTopic in tSubs
    put tTopic & return after field "Subscriptions"
@@ -538,7 +538,7 @@ end repeat
 
 Get detailed connection information.
 
-```livecode
+```OXT
 function mqttGetConnectionInfo(pHost, pPort)
 ```
 
@@ -560,7 +560,7 @@ function mqttGetConnectionInfo(pHost, pPort)
 - `reconnectAttempts` - Number of reconnection attempts
 
 **Example:**
-```livecode
+```OXT
 put mqttGetConnectionInfo("broker.example.com", 1883) into tInfo
 put tInfo["clientID"]  -- Access specific field
 put tInfo["connected"]
@@ -572,7 +572,7 @@ put tInfo["connected"]
 
 Get connection statistics.
 
-```livecode
+```OXT
 function mqttGetStatistics(pHost, pPort)
 ```
 
@@ -590,7 +590,7 @@ function mqttGetStatistics(pHost, pPort)
 - `reconnections` - Number of reconnections
 
 **Example:**
-```livecode
+```OXT
 put mqttGetStatistics("broker.example.com", 1883) into tStats
 put "Sent:" && tStats["messagesSent"]
 put "Received:" && tStats["messagesReceived"]
@@ -603,7 +603,7 @@ put "Data sent:" && tStats["bytesSent"] && "bytes"
 
 Reset statistics counters.
 
-```livecode
+```OXT
 command mqttResetStatistics pHost, pPort
 ```
 
@@ -612,7 +612,7 @@ command mqttResetStatistics pHost, pPort
 - `pPort` - Broker port
 
 **Example:**
-```livecode
+```OXT
 mqttResetStatistics "broker.example.com", 1883
 ```
 
@@ -622,7 +622,7 @@ mqttResetStatistics "broker.example.com", 1883
 
 Check if broker has persistent session.
 
-```livecode
+```OXT
 function mqttGetSessionPresent(pHost, pPort)
 ```
 
@@ -633,7 +633,7 @@ function mqttGetSessionPresent(pHost, pPort)
 **Returns:** Boolean (true/false)
 
 **Example:**
-```livecode
+```OXT
 if mqttGetSessionPresent("broker.example.com", 1883) then
    put "Previous session restored"
 end if
@@ -645,14 +645,14 @@ end if
 
 Get list of all active connections.
 
-```livecode
+```OXT
 function mqttGetConnections()
 ```
 
 **Returns:** Line-delimited list of connections in "host:port" format
 
 **Example:**
-```livecode
+```OXT
 put mqttGetConnections() into tConns
 repeat for each line tConn in tConns
    put tConn & return after field "Connections"
@@ -665,14 +665,14 @@ end repeat
 
 Verify library is loaded.
 
-```livecode
+```OXT
 function mqttTestLibrary()
 ```
 
 **Returns:** Version string
 
 **Example:**
-```livecode
+```OXT
 put mqttTestLibrary()
 -- Returns: "MQTT Library v2.11.8 loaded successfully (Test Suite 100% Compliance)"
 ```
@@ -683,14 +683,14 @@ put mqttTestLibrary()
 
 Run internal library self-tests.
 
-```livecode
+```OXT
 function mqttSelfTest()
 ```
 
 **Returns:** Test results string
 
 **Example:**
-```livecode
+```OXT
 put mqttSelfTest() into field "TestResults"
 ```
 
@@ -700,7 +700,7 @@ put mqttSelfTest() into field "TestResults"
 
 Performance benchmark test.
 
-```livecode
+```OXT
 function mqttBenchmark(pHost, pPort, pMessageCount, pMessageSize)
 ```
 
@@ -713,7 +713,7 @@ function mqttBenchmark(pHost, pPort, pMessageCount, pMessageSize)
 **Returns:** Formatted benchmark results
 
 **Example:**
-```livecode
+```OXT
 put mqttBenchmark("broker.example.com", 1883, 1000, 100) into tResults
 put tResults
 ```
@@ -728,7 +728,7 @@ All callback handlers must be defined in the callback target object.
 
 Invoked when a message is received.
 
-```livecode
+```OXT
 on handlerName pTopic, pMessage
    -- pTopic: UTF-8 topic string
    -- pMessage: Binary-safe message payload
@@ -736,7 +736,7 @@ end handlerName
 ```
 
 **Example:**
-```livecode
+```OXT
 mqttSetMessageCallback "onMessage"
 
 on onMessage pTopic, pMessage
@@ -757,14 +757,14 @@ end onMessage
 
 Invoked for log messages.
 
-```livecode
+```OXT
 on handlerName pMessage
    -- pMessage: Log message string
 end handlerName
 ```
 
 **Example:**
-```livecode
+```OXT
 mqttSetLogCallback "onLog"
 
 on onLog pMessage
@@ -778,7 +778,7 @@ end onLog
 
 Invoked when connection state changes.
 
-```livecode
+```OXT
 on handlerName pState, pHost, pPort, pReason
    -- pState: connecting, connected, disconnecting, disconnected, error
    -- pHost: Broker hostname
@@ -788,7 +788,7 @@ end handlerName
 ```
 
 **Example:**
-```livecode
+```OXT
 mqttSetStateChangeCallback "onStateChange"
 
 on onStateChange pState, pHost, pPort, pReason
@@ -806,7 +806,7 @@ end onStateChange
 
 Invoked during reconnection attempts.
 
-```livecode
+```OXT
 on handlerName pEvent, pHost, pPort, pAttempts
    -- pEvent: attempting, success, failed
    -- pHost: Broker hostname
@@ -816,7 +816,7 @@ end handlerName
 ```
 
 **Example:**
-```livecode
+```OXT
 mqttSetReconnectCallback "onReconnect"
 
 on onReconnect pEvent, pHost, pPort, pAttempts
@@ -843,7 +843,7 @@ All connection and messaging functions return either "OK" or "ERROR: description
 - `ERROR: Buffer overflow` - Receive buffer exceeded limit
 
 **Example Error Handling:**
-```livecode
+```OXT
 put mqttPublish("broker.example.com", 1883, "test", "msg", 0, false) into tResult
 if tResult is not "OK" then
    answer "Publish failed:" && tResult
@@ -857,7 +857,7 @@ end if
 
 ### Basic Connection and Publish
 
-```livecode
+```OXT
 on mouseUp
    -- Configure callbacks
    mqttSetCallbackTarget the long id of this card
@@ -893,7 +893,7 @@ end onLog
 
 ### TLS Connection with Authentication
 
-```livecode
+```OXT
 on connectSecure
    local tResult
    
@@ -922,7 +922,7 @@ end handleMessage
 
 ### Subscribe with Wildcards
 
-```livecode
+```OXT
 on setupSubscriptions
    local tResult
    
@@ -943,7 +943,7 @@ end setupSubscriptions
 
 ### Auto-Reconnect Configuration
 
-```livecode
+```OXT
 on connectWithAutoReconnect
    local tResult
    
@@ -977,7 +977,7 @@ end onStateChange
 
 ### Last Will and Testament
 
-```livecode
+```OXT
 on connectWithLWT
    local tResult
    
@@ -996,7 +996,7 @@ end connectWithLWT
 
 ### QoS 2 Exactly-Once Delivery
 
-```livecode
+```OXT
 on publishCritical
    local tResult
    
@@ -1016,7 +1016,7 @@ end publishCritical
 
 ### Retained Messages
 
-```livecode
+```OXT
 on publishStatus
    -- Publish retained message
    -- Last published message is retained by broker
@@ -1036,7 +1036,7 @@ end clearRetainedMessage
 
 ### Monitoring Connection Statistics
 
-```livecode
+```OXT
 on updateStatistics
    local tStats
    
@@ -1057,7 +1057,7 @@ end updateStatistics
 
 ### Multiple Connections
 
-```livecode
+```OXT
 on setupMultipleConnections
    -- Connect to first broker
    put mqttConnect("broker1.example.com", 1883, "client1", \
@@ -1087,7 +1087,7 @@ end setupMultipleConnections
 
 ### Complete Application Example
 
-```livecode
+```OXT
 -- Card Script
 
 local sHost, sPort
@@ -1120,7 +1120,7 @@ end mouseUp
 on connectToBroker
    local tResult
    
-   put mqttConnect(sHost, sPort, "LiveCodeClient", "", "", \
+   put mqttConnect(sHost, sPort, "OXTClient", "", "", \
                    60, false, true, "", "", 0, false, \
                    false, false, "") into tResult
    
@@ -1188,7 +1188,7 @@ end handleStateChange
 ## Notes
 
 ### Thread Safety
-The library is single-threaded. All operations occur on the main LiveCode thread.
+The library is single-threaded. All operations occur on the main OXT thread.
 
 ### Binary Data
 Message payloads are binary-safe. Use `binaryEncode`/`binaryDecode` for binary data.
