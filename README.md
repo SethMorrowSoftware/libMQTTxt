@@ -1,6 +1,6 @@
-# libMQTTxt MQTT Client Library for LiveCode
+# libMQTTxt MQTT Client Library for OXT
 
-A pure LiveCode implementation of MQTT 3.1.1 protocol client with full QoS support, TLS encryption, and automatic reconnection.
+A pure OXT implementation of MQTT 3.1.1 protocol client with full QoS support, TLS encryption, and automatic reconnection.
 
 ## Features
 
@@ -19,16 +19,16 @@ A pure LiveCode implementation of MQTT 3.1.1 protocol client with full QoS suppo
 
 ## Requirements
 
-- LiveCode 9.0 or higher
+- OXT 9.0 or higher
 - Network access to MQTT broker
 
 ## Installation
 
 1. Download `script_only_stack_` file
-2. Place in your LiveCode project directory
+2. Place in your OXT project directory
 3. Load the library in your stack:
 
-```livecode
+```OXT
 on preOpenStack
    start using stack "script_only_stack_"
 end preOpenStack
@@ -36,7 +36,7 @@ end preOpenStack
 
 ## Quick Start
 
-```livecode
+```OXT
 -- Configure callbacks
 mqttSetCallbackTarget the long id of this card
 mqttSetMessageCallback "onMessage"
@@ -69,7 +69,7 @@ end onMessage
 
 ### Basic Connection
 
-```livecode
+```OXT
 -- Simple connection
 put mqttConnectSimple("broker.example.com", 1883, "client1", "user", "pass") into tResult
 
@@ -80,7 +80,7 @@ end if
 
 ### TLS Connection
 
-```livecode
+```OXT
 -- Connect with TLS encryption
 put mqttConnect("broker.example.com", 8883, "secureClient", \
                 "username", "password", 60, true, true, \
@@ -89,7 +89,7 @@ put mqttConnect("broker.example.com", 8883, "secureClient", \
 
 ### Subscribe with Wildcards
 
-```livecode
+```OXT
 -- Subscribe to all sensors
 mqttSubscribe "broker.example.com", 1883, "sensor/#", 0
 
@@ -99,7 +99,7 @@ mqttSubscribe "broker.example.com", 1883, "room/+/temperature", 0
 
 ### QoS Levels
 
-```livecode
+```OXT
 -- QoS 0 - Fire and forget
 mqttPublish "broker.example.com", 1883, "data", "value", 0, false
 
@@ -112,7 +112,7 @@ mqttPublish "broker.example.com", 1883, "critical", "command", 2, false
 
 ### Retained Messages
 
-```livecode
+```OXT
 -- Publish retained message
 mqttPublish "broker.example.com", 1883, "device/status", "online", 0, true
 
@@ -122,7 +122,7 @@ mqttPublish "broker.example.com", 1883, "device/status", "", 0, true
 
 ### Last Will Testament
 
-```livecode
+```OXT
 -- Configure LWT - published if client disconnects unexpectedly
 put mqttConnect("broker.example.com", 1883, "device1", "", "", 60, \
                 false, true, "device/status", "offline", 1, true, \
@@ -131,7 +131,7 @@ put mqttConnect("broker.example.com", 1883, "device1", "", "", 60, \
 
 ### Auto-Reconnect
 
-```livecode
+```OXT
 -- Enable automatic reconnection
 mqttSetReconnectCallback "onReconnect"
 
@@ -147,7 +147,7 @@ end onReconnect
 
 ### Connection Statistics
 
-```livecode
+```OXT
 put mqttGetStatistics("broker.example.com", 1883) into tStats
 
 put "Messages sent:" && tStats["messagesSent"]
@@ -160,7 +160,7 @@ put "Reconnections:" && tStats["reconnections"]
 
 ### Callbacks
 
-```livecode
+```OXT
 -- Set callback target (required)
 mqttSetCallbackTarget the long id of this card
 
@@ -179,7 +179,7 @@ mqttSetReconnectCallback "handleReconnect"
 
 ### Options
 
-```livecode
+```OXT
 -- Enable debug logging
 mqttSetDebugMode true
 
@@ -250,7 +250,7 @@ mqttSetPersistentStore true, specialFolderPath("documents") & "/mqtt"
 
 All functions return `"OK"` on success or `"ERROR: description"` on failure.
 
-```livecode
+```OXT
 put mqttPublish("broker.example.com", 1883, "topic", "msg", 0, false) into tResult
 
 if tResult is not "OK" then
@@ -337,7 +337,7 @@ MQTT 3.1.1 Specification Implementation:
 
 The library is implemented as a script-only stack with:
 
-- **Socket Management** - LiveCode native socket handling
+- **Socket Management** - OXT native socket handling
 - **Packet Encoding/Decoding** - Binary encoding for MQTT packets
 - **State Machine** - Connection and QoS state tracking
 - **Timer Management** - Keep-alive and reconnection timers
@@ -346,7 +346,7 @@ The library is implemented as a script-only stack with:
 
 ## Limitations
 
-- Single-threaded (runs on main LiveCode thread)
+- Single-threaded (runs on main OXT thread)
 - Maximum message size limited by `mqttSetMaxBufferSize` (default 5MB)
 - Socket callbacks require library in `stacksInUse`
 - Topic length limits depend on broker (typically 256 characters)
@@ -354,25 +354,25 @@ The library is implemented as a script-only stack with:
 ## Common Use Cases
 
 ### IoT Sensor Data
-```livecode
+```OXT
 -- Publish sensor readings with QoS 0
 mqttPublish "broker.example.com", 1883, "sensor/temp", tReading, 0, false
 ```
 
 ### Command & Control
-```livecode
+```OXT
 -- Send critical commands with QoS 2
 mqttPublish "broker.example.com", 1883, "device/command", "SHUTDOWN", 2, false
 ```
 
 ### Status Monitoring
-```livecode
+```OXT
 -- Publish retained status messages
 mqttPublish "broker.example.com", 1883, "device/status", "online", 0, true
 ```
 
 ### Data Logging
-```livecode
+```OXT
 -- Subscribe to all device data
 mqttSubscribe "broker.example.com", 1883, "device/#", 1
 ```
