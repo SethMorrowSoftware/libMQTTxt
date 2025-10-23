@@ -22,7 +22,7 @@ Load the library in your stack script:
 
 ```OXT
 on preOpenStack
-   start using stack "script_only_stack_"
+   start using stack "libMQTTxt.oxtstack"
 end preOpenStack
 ```
 
