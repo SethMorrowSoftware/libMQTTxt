@@ -1,7 +1,7 @@
 script "libMQTTxt"
 
 -- ========================================
--- MQTT Client Library for LiveCode
+-- MQTT Client Library for OXT
 -- Pure Library Version - MQTT 3.1.1 Compliant
 -- Version 2.11.8 - Test Suite 100% Compliance
 -- ========================================
@@ -27,7 +27,7 @@ script "libMQTTxt"
 -- ========================================
 
 global gMQTTConnections           -- Array of all active connections indexed by "host:port"
-global gMQTTConnIndex             -- Maps LiveCode socket IDs to connection IDs (for multi-connection)
+global gMQTTConnIndex             -- Maps OXT socket IDs to connection IDs (for multi-connection)
 global gMQTTQuietMode             -- Suppress debug logging when true
 global gMQTTMessageCallback       -- Handler name for incoming messages
 global gMQTTLogCallback           -- Handler name for log messages
