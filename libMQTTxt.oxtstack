@@ -1023,9 +1023,9 @@ private command __validateCallbackEnvironment
    local tStackList
    put the stacksInUse into tStackList
    
-   if "MQTTClientLibrary" is not among the lines of tStackList then
-      __mqttLog "WARNING: MQTTClientLibrary not in stacksInUse - socket callbacks may not work"
-      __mqttLog "Add 'start using stack" && quote & "MQTTClientLibrary" & quote && "' to your startup code"
+   if "libMQTTxt.oxtstack" is not among the lines of tStackList then
+      __mqttLog "WARNING: libMQTTxt.oxtstack not in stacksInUse - socket callbacks may not work"
+      __mqttLog "Add 'start using stack" && quote & "libMQTTxt.oxtstack" & quote && "' to your startup code"
    end if
    
    -- Verify callback target exists and is accessible
