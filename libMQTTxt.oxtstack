@@ -1,4 +1,4 @@
-script "MQTTClientLibrary"
+script "libMQTTxt"
 
 -- ========================================
 -- MQTT Client Library for LiveCode
