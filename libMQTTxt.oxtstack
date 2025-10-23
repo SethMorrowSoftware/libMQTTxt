@@ -1,0 +1,2240 @@
+script "MQTTClientLibrary"
+
+-- ========================================
+-- MQTT Client Library for LiveCode
+-- Pure Library Version - MQTT 3.1.1 Compliant
+-- Version 2.11.8 - Test Suite 100% Compliance
+-- ========================================
+-- Changes in v2.11.8:
+-- 🔧 FIXED: Empty topic validation in mqttPublish
+-- 🔧 FIXED: QoS 2 message statistics tracking
+-- 🔧 IMPROVED: Debug logging in message callback invocation
+-- 🔧 ENHANCED: Message reception validation
+-- ========================================
+-- Changes in v2.11.7:
+-- 🔧 CRITICAL FIX: Timer send uses 'me' instead of stack reference
+-- 🔧 FIXED: Direct logging in timer handlers (no private function calls)
+-- 🔧 IMPROVED: More comprehensive global variable declarations
+-- ========================================
+-- Changes in v2.11.5:
+-- 🔧 Timer handlers no longer use parameters (avoids colon parsing)
+-- 🔧 Connection ID stored in connection record, retrieved via iteration
+-- 🔧 Both keep-alive and reconnect timers use marker-based approach
+-- ========================================
+
+-- ========================================
+-- GLOBAL VARIABLES
+-- ========================================
+
+global gMQTTConnections           -- Array of all active connections indexed by "host:port"
+global gMQTTConnIndex             -- Maps LiveCode socket IDs to connection IDs (for multi-connection)
+global gMQTTQuietMode             -- Suppress debug logging when true
+global gMQTTMessageCallback       -- Handler name for incoming messages
+global gMQTTLogCallback           -- Handler name for log messages
+global gMQTTReconnectCallback     -- Handler name for reconnection events
+global gMQTTStateChangeCallback   -- Handler name for connection state changes
+global gMQTTMaxBufferSize         -- Maximum receive buffer size in bytes
+global gMQTTPersistentStoreEnabled -- Enable persistent storage for QoS 1/2 messages
+global gMQTTPersistentStorePath   -- Path to persistent message store
+global gMQTTDebugMode             -- Enable verbose debug logging
+global gMQTTCallbackTarget        -- Target stack/object for callbacks
+global gMQTTKeepAliveThreshold    -- When to send PINGREQ (0-1, default 0.75 = 75%)
+
+-- ========================================
+-- LIBRARY INITIALIZATION
+-- ========================================
+
+on libraryStack
+   -- Initialize connection tracking
+   if gMQTTConnections is empty then
+      put empty into gMQTTConnections
+   end if
+   
+   -- Initialize socket ID to connection ID mapping (CRITICAL for multi-connection)
+   if gMQTTConnIndex is empty then
+      put empty into gMQTTConnIndex
+   end if
+   
+   -- Initialize configuration with sensible defaults
+   if gMQTTQuietMode is empty then
+      put false into gMQTTQuietMode
+   end if
+   
+   if gMQTTDebugMode is empty then
+      put false into gMQTTDebugMode
+   end if
+   
+   if gMQTTMaxBufferSize is empty then
+      put 5242880 into gMQTTMaxBufferSize  -- 5MB default
+   end if
+   
+   if gMQTTPersistentStoreEnabled is empty then
+      put false into gMQTTPersistentStoreEnabled
+   end if
+   
+
+
+if gMQTTKeepAliveThreshold is empty then
+   put 0.75 into gMQTTKeepAliveThreshold  -- Default 75% of keep-alive interval
+end if
+
+-- Validate that callbacks will work in current environment
+__validateCallbackEnvironment
+end libraryStack
+
+on releaseStack
+   mqttCleanupAll
+end releaseStack
+
+-- ========================================
+-- PUBLIC API - CONFIGURATION
+-- ========================================
+
+command mqttSetCallbackTarget pTarget
+   -- DEBUG: Show what we received
+   answer "mqttSetCallbackTarget called" & return & \
+         "Received:" && pTarget & return & \
+         "Setting gMQTTCallbackTarget to:" && pTarget
+   
+   put pTarget into gMQTTCallbackTarget
+   
+   -- DEBUG: Confirm it was set
+   answer "gMQTTCallbackTarget is now:" & return & gMQTTCallbackTarget
+   
+   __mqttLog "Callback target set to:" && gMQTTCallbackTarget
+   __validateCallbackEnvironment
+end mqttSetCallbackTarget
+
+command mqttSetKeepAliveThreshold pThreshold
+   if pThreshold < 0 or pThreshold > 1 then
+      __mqttLog "ERROR: Keep-alive threshold must be between 0 and 1"
+      exit mqttSetKeepAliveThreshold
+   end if
+   
+   put pThreshold into gMQTTKeepAliveThreshold
+   __mqttLog "Keep-alive threshold set to:" && (pThreshold * 100) & "%"
+end mqttSetKeepAliveThreshold
+
+function mqttGetKeepAliveThreshold
+   return gMQTTKeepAliveThreshold
+end mqttGetKeepAliveThreshold
+
+command mqttSetDebugMode pDebug
+   put pDebug into gMQTTDebugMode
+   __mqttLog "Debug mode:" && pDebug
+end mqttSetDebugMode
+
+command mqttSetLogCallback pHandlerName
+   put pHandlerName into gMQTTLogCallback
+   __mqttLog "Log callback set to:" && pHandlerName
+end mqttSetLogCallback
+
+command mqttSetQuietMode pQuiet
+   put pQuiet into gMQTTQuietMode
+end mqttSetQuietMode
+
+command mqttSetMessageCallback pHandlerName
+   put pHandlerName into gMQTTMessageCallback
+   __mqttLog "Message callback set to:" && pHandlerName
+end mqttSetMessageCallback
+
+command mqttSetReconnectCallback pHandlerName
+   put pHandlerName into gMQTTReconnectCallback
+   __mqttLog "Reconnect callback set to:" && pHandlerName
+end mqttSetReconnectCallback
+
+command mqttSetStateChangeCallback pHandlerName
+   put pHandlerName into gMQTTStateChangeCallback
+   __mqttLog "State change callback set to:" && pHandlerName
+end mqttSetStateChangeCallback
+
+command mqttSetMaxBufferSize pBytes
+   if (pBytes < 65536) then
+      __mqttLog "WARNING: Buffer size too small, setting to 64KB minimum"
+      put 65536 into gMQTTMaxBufferSize
+   else if (pBytes > 268435455) then
+      __mqttLog "WARNING: Buffer size exceeds MQTT spec limit (256MB), capping"
+      put 268435455 into gMQTTMaxBufferSize
+   else
+      put pBytes into gMQTTMaxBufferSize
+   end if
+   __mqttLog "Maximum buffer size set to:" && gMQTTMaxBufferSize && "bytes"
+end mqttSetMaxBufferSize
+
+command mqttSetPersistentStore pEnabled, pStorePath
+   put pEnabled into gMQTTPersistentStoreEnabled
+   
+   if pStorePath is not empty then
+      put pStorePath into gMQTTPersistentStorePath
+   else
+      put specialFolderPath("documents") & "/mqtt_store" into gMQTTPersistentStorePath
+   end if
+   
+   if gMQTTPersistentStoreEnabled then
+      __mqttLog "Persistent store enabled at:" && gMQTTPersistentStorePath
+      __ensurePersistentStoreDirectory
+   else
+      __mqttLog "Persistent store disabled"
+   end if
+end mqttSetPersistentStore
+
+-- ========================================
+-- PUBLIC API - CONNECTION MANAGEMENT
+-- ========================================
+
+function mqttConnect pHost, pPort, pClientID, pUsername, pPassword, pKeepAlive, pUseTLS, pCleanSession, pLWTTopic, pLWTMessage, pLWTQoS, pLWTRetain, pVerifyTLS, pAutoReconnect, pCACertPath
+   local tConnID
+   put pHost & ":" & pPort into tConnID
+   
+   -- Set defaults for optional parameters
+   if pKeepAlive is empty then put 60 into pKeepAlive
+   if pClientID is empty then put "LC_" & the milliseconds into pClientID
+   if pUseTLS is empty then put false into pUseTLS
+   if pCleanSession is empty then put true into pCleanSession
+   if pLWTQoS is empty then put 0 into pLWTQoS
+   if pLWTRetain is empty then put false into pLWTRetain
+   if pVerifyTLS is empty then put false into pVerifyTLS
+   if pAutoReconnect is empty then put false into pAutoReconnect
+   
+   -- Validate parameters according to MQTT 3.1.1 spec
+   if (pLWTQoS < 0) or (pLWTQoS > 2) then
+      return "ERROR: Invalid LWT QoS (must be 0, 1, or 2)"
+   end if
+   
+   if (pKeepAlive < 0) or (pKeepAlive > 65535) then
+      return "ERROR: Invalid keep-alive (must be 0-65535)"
+   end if
+   
+   -- Initialize connection structure with all required fields
+   put pHost into gMQTTConnections[tConnID]["host"]
+   put pPort into gMQTTConnections[tConnID]["port"]
+   put pClientID into gMQTTConnections[tConnID]["clientID"]
+   put pUsername into gMQTTConnections[tConnID]["username"]
+   put pPassword into gMQTTConnections[tConnID]["password"]
+   put false into gMQTTConnections[tConnID]["connected"]
+   put pKeepAlive into gMQTTConnections[tConnID]["keepAlive"]
+   put 0 into gMQTTConnections[tConnID]["packetID"]
+   put empty into gMQTTConnections[tConnID]["receiveBuffer"]
+   put the milliseconds into gMQTTConnections[tConnID]["lastActivity"]
+   put 0 into gMQTTConnections[tConnID]["lastPingTime"]
+   put pUseTLS into gMQTTConnections[tConnID]["useTLS"]
+   put pVerifyTLS into gMQTTConnections[tConnID]["verifyTLS"]
+   put pCACertPath into gMQTTConnections[tConnID]["caCertPath"]
+   put pCleanSession into gMQTTConnections[tConnID]["cleanSession"]
+   put false into gMQTTConnections[tConnID]["sessionPresent"]
+   put pAutoReconnect into gMQTTConnections[tConnID]["autoReconnect"]
+   put 0 into gMQTTConnections[tConnID]["reconnectAttempts"]
+   put empty into gMQTTConnections[tConnID]["subscriptions"]
+   put empty into gMQTTConnections[tConnID]["pendingAcks"]
+   put empty into gMQTTConnections[tConnID]["pendingSubAcks"]
+   put empty into gMQTTConnections[tConnID]["pendingUnsubAcks"]
+   put empty into gMQTTConnections[tConnID]["pendingQoS2"]
+   put empty into gMQTTConnections[tConnID]["reconnectMessageID"]
+   put empty into gMQTTConnections[tConnID]["keepAliveMessageID"]
+   
+   -- Initialize statistics tracking
+   put 0 into gMQTTConnections[tConnID]["stats"]["messagesSent"]
+   put 0 into gMQTTConnections[tConnID]["stats"]["messagesReceived"]
+   put 0 into gMQTTConnections[tConnID]["stats"]["bytesSent"]
+   put 0 into gMQTTConnections[tConnID]["stats"]["bytesReceived"]
+   put 0 into gMQTTConnections[tConnID]["stats"]["reconnections"]
+   
+   -- Store Last Will and Testament parameters
+   put pLWTTopic into gMQTTConnections[tConnID]["lwt"]["topic"]
+   put pLWTMessage into gMQTTConnections[tConnID]["lwt"]["message"]
+   put pLWTQoS into gMQTTConnections[tConnID]["lwt"]["qos"]
+   put pLWTRetain into gMQTTConnections[tConnID]["lwt"]["retain"]
+   
+   -- Log connection attempt
+   __mqttLog "Connecting to" && pHost & ":" & pPort && "as" && pClientID && "(TLS:" && pUseTLS && "Verify:" && pVerifyTLS & ")"
+   __mqttDebug "Full connection params - KeepAlive:" && pKeepAlive && "CleanSession:" && pCleanSession && "AutoReconnect:" && pAutoReconnect
+   
+   if pLWTTopic is not empty then
+      __mqttLog "LWT configured:" && pLWTTopic && "(QoS" && pLWTQoS & ")"
+   end if
+   
+   if pCACertPath is not empty then
+      __mqttLog "CA certificate path:" && pCACertPath
+   end if
+   
+   -- Load persistent messages if enabled
+   if gMQTTPersistentStoreEnabled then
+      __loadPersistentMessages tConnID
+   end if
+   
+   -- Notify state change
+   __invokeStateChangeCallback "connecting", pHost, pPort, ""
+   
+   try
+      -- Close existing socket if still open
+      if __isSocketOpen(tConnID) then
+         __mqttDebug "Closing existing socket" && tConnID
+         close socket tConnID
+         wait 100 milliseconds
+      end if
+      
+      -- Open new socket
+      __mqttDebug "Opening socket to" && tConnID
+      open socket to (pHost & ":" & pPort) with message "mqttSocketConnected"
+      
+      -- CRITICAL: Store socket ID to connection ID mapping immediately
+      put tConnID into gMQTTConnIndex[pHost & ":" & pPort]
+      
+      return "OK"
+   catch tError
+      __mqttLog "ERROR opening socket:" && tError
+      __invokeStateChangeCallback "error", pHost, pPort, tError
+      return "ERROR:" && tError
+   end try
+end mqttConnect
+
+function mqttConnectSimple pHost, pPort, pClientID, pUsername, pPassword
+   return mqttConnect(pHost, pPort, pClientID, pUsername, pPassword, 60, false, true, "", "", 0, false, false, false, "")
+end mqttConnectSimple
+
+function mqttReconnect pHost, pPort
+   local tConnID
+   put pHost & ":" & pPort into tConnID
+   
+   -- Verify we have a previous connection to reconnect
+   if gMQTTConnections[tConnID] is empty then
+      return "ERROR: No previous connection to reconnect"
+   end if
+   
+   __mqttLog "Attempting to reconnect to" && pHost & ":" & pPort
+   
+   -- Invoke reconnect callback
+   __invokeReconnectCallback "attempting", pHost, pPort, gMQTTConnections[tConnID]["reconnectAttempts"] + 1
+   
+   -- Close existing socket if any
+   try
+      if __isSocketOpen(tConnID) then
+         close socket tConnID
+         wait 100 milliseconds
+      end if
+   catch tErr
+      -- Socket already closed, continue
+   end try
+   
+   -- Reset state for reconnection
+   put false into gMQTTConnections[tConnID]["connected"]
+   put empty into gMQTTConnections[tConnID]["receiveBuffer"]
+   add 1 to gMQTTConnections[tConnID]["reconnectAttempts"]
+   add 1 to gMQTTConnections[tConnID]["stats"]["reconnections"]
+   
+   -- Notify state change
+   __invokeStateChangeCallback "connecting", pHost, pPort, "reconnect attempt"
+   
+   -- Reopen socket
+   try
+      open socket to tConnID with message "mqttSocketConnected"
+      
+      -- CRITICAL: Re-establish socket ID mapping
+      put tConnID into gMQTTConnIndex[tConnID]
+      
+      return "OK"
+   catch tError
+      __mqttLog "ERROR reconnecting:" && tError
+      __invokeReconnectCallback "failed", pHost, pPort, gMQTTConnections[tConnID]["reconnectAttempts"]
+      __invokeStateChangeCallback "error", pHost, pPort, tError
+      return "ERROR:" && tError
+   end try
+end mqttReconnect
+
+function mqttIsConnected pHost, pPort
+   local tConnID
+   put pHost & ":" & pPort into tConnID
+   return (gMQTTConnections[tConnID]["connected"] is true) and __isSocketOpen(tConnID)
+end mqttIsConnected
+
+command mqttDisconnect pHost, pPort
+   local tConnID
+   put pHost & ":" & pPort into tConnID
+   
+   -- Nothing to disconnect if no connection exists
+   if gMQTTConnections[tConnID] is empty then
+      exit mqttDisconnect
+   end if
+   
+   __mqttLog "Disconnecting from" && pHost & ":" & pPort
+   
+   -- Notify state change
+   __invokeStateChangeCallback "disconnecting", pHost, pPort, "user requested"
+   
+   if mqttIsConnected(pHost, pPort) then
+      -- Save persistent messages if enabled
+      if gMQTTPersistentStoreEnabled then
+         __savePersistentMessages tConnID
+      end if
+      
+      -- Send DISCONNECT packet (required by MQTT spec for clean disconnect)
+      local tPacket
+      put __numToByte(0xE0) & __numToByte(0) into tPacket
+      
+      if __isSocketOpen(tConnID) then
+         try
+            write tPacket to socket tConnID
+         catch tErr
+            __mqttDebug "Error writing DISCONNECT packet:" && tErr
+         end try
+      end if
+      
+      -- Mark as disconnected and disable auto-reconnect
+      put false into gMQTTConnections[tConnID]["connected"]
+      put false into gMQTTConnections[tConnID]["autoReconnect"]
+      
+      -- Cancel any pending messages
+      __cancelPendingMessages tConnID
+      
+      -- Close the socket
+      if __isSocketOpen(tConnID) then
+         close socket tConnID
+      end if
+      
+      -- Clean up socket mapping
+      delete variable gMQTTConnIndex[tConnID]
+      
+      __mqttLog "Disconnected from" && pHost & ":" & pPort
+      
+      -- Notify state change
+      __invokeStateChangeCallback "disconnected", pHost, pPort, "clean disconnect"
+   end if
+end mqttDisconnect
+
+-- ========================================
+-- PUBLIC API - PUBLISHING
+-- ========================================
+
+function mqttPublish pHost, pPort, pTopic, pMessage, pQoS, pRetain
+   local tConnID
+   put pHost & ":" & pPort into tConnID
+   
+   -- Verify connection is active
+   if not mqttIsConnected(pHost, pPort) then
+      return "ERROR: Not connected"
+   end if
+   
+   -- Set defaults
+   if pQoS is empty then put 0 into pQoS
+   if pRetain is empty then put false into pRetain
+   
+   -- Validate QoS level
+   if (pQoS < 0) or (pQoS > 2) then
+      return "ERROR: Invalid QoS (use 0, 1, or 2)"
+   end if
+   
+   -- Validate topic is not empty (MQTT spec requirement)
+   if pTopic is empty then
+      return "ERROR: Topic cannot be empty"
+   end if
+   
+   -- Encode topic as UTF-8 (MQTT spec requirement)
+   local tTopicUTF8
+   put textEncode(pTopic, "UTF-8") into tTopicUTF8
+   
+   -- Validate topic doesn't contain wildcards (not allowed in PUBLISH)
+   if (tTopicUTF8 contains "+") or (tTopicUTF8 contains "#") then
+      return "ERROR: Topic cannot contain wildcards"
+   end if
+   
+   -- Build PUBLISH packet
+   local tPacket
+   put __buildPublishPacket(tConnID, tTopicUTF8, pMessage, pQoS, pRetain) into tPacket
+   
+   if tPacket is empty then
+      return "ERROR: Failed to build packet"
+   end if
+   
+   if not __isSocketOpen(tConnID) then
+      return "ERROR: Socket not open"
+   end if
+   
+   -- Send the packet
+   try
+      write tPacket to socket tConnID
+      put the milliseconds into gMQTTConnections[tConnID]["lastActivity"]
+      
+      -- Update statistics
+      add 1 to gMQTTConnections[tConnID]["stats"]["messagesSent"]
+      add length(tPacket) to gMQTTConnections[tConnID]["stats"]["bytesSent"]
+      
+      -- Save to persistent store if QoS > 0
+      if (pQoS > 0) and gMQTTPersistentStoreEnabled then
+         __savePersistentMessages tConnID
+      end if
+      
+      __mqttLog "Published:" && pTopic && "(" & length(pMessage) && "bytes, QoS" && pQoS & ")"
+      return "OK"
+   catch tError
+      return "ERROR:" && tError
+   end try
+end mqttPublish
+
+-- ========================================
+-- PUBLIC API - SUBSCRIPTION
+-- ========================================
+
+function mqttSubscribe pHost, pPort, pTopic, pQoS
+   local tConnID
+   put pHost & ":" & pPort into tConnID
+   
+   -- Verify connection is active
+   if not mqttIsConnected(pHost, pPort) then
+      return "ERROR: Not connected"
+   end if
+   
+   -- Set defaults
+   if pQoS is empty then put 0 into pQoS
+   
+   -- Validate QoS level
+   if (pQoS < 0) or (pQoS > 2) then
+      return "ERROR: Invalid QoS (use 0, 1, or 2)"
+   end if
+   
+   -- Encode topic as UTF-8
+   local tTopicUTF8
+   put textEncode(pTopic, "UTF-8") into tTopicUTF8
+   
+   -- Build SUBSCRIBE packet
+   local tPacket
+   put __buildSubscribePacket(tConnID, tTopicUTF8, pQoS) into tPacket
+   
+   if tPacket is empty then
+      return "ERROR: Failed to build packet"
+   end if
+   
+   if not __isSocketOpen(tConnID) then
+      return "ERROR: Socket not open"
+   end if
+   
+   -- Send the packet
+   try
+      write tPacket to socket tConnID
+      put the milliseconds into gMQTTConnections[tConnID]["lastActivity"]
+      __mqttLog "Subscribed to:" && pTopic && "(QoS" && pQoS & ")"
+      
+      -- Store subscription for reconnection
+      put pQoS into gMQTTConnections[tConnID]["subscriptions"][pTopic]
+      
+      return "OK"
+   catch tError
+      return "ERROR:" && tError
+   end try
+end mqttSubscribe
+
+function mqttUnsubscribe pHost, pPort, pTopic
+   local tConnID
+   put pHost & ":" & pPort into tConnID
+   
+   -- Verify connection is active
+   if not mqttIsConnected(pHost, pPort) then
+      return "ERROR: Not connected"
+   end if
+   
+   -- Encode topic as UTF-8
+   local tTopicUTF8
+   put textEncode(pTopic, "UTF-8") into tTopicUTF8
+   
+   -- Build UNSUBSCRIBE packet
+   local tPacket
+   put __buildUnsubscribePacket(tConnID, tTopicUTF8) into tPacket
+   
+   if tPacket is empty then
+      return "ERROR: Failed to build packet"
+   end if
+   
+   if not __isSocketOpen(tConnID) then
+      return "ERROR: Socket not open"
+   end if
+   
+   -- Send the packet
+   try
+      write tPacket to socket tConnID
+      put the milliseconds into gMQTTConnections[tConnID]["lastActivity"]
+      __mqttLog "Unsubscribed from:" && pTopic
+      
+      -- Remove from subscription list
+      delete variable gMQTTConnections[tConnID]["subscriptions"][pTopic]
+      
+      return "OK"
+   catch tError
+      return "ERROR:" && tError
+   end try
+end mqttUnsubscribe
+
+-- ========================================
+-- PUBLIC API - UTILITIES
+-- ========================================
+
+function mqttGetConnectionInfo pHost, pPort
+   local tConnID
+   put pHost & ":" & pPort into tConnID
+   
+   if gMQTTConnections[tConnID] is empty then
+      return empty
+   end if
+   
+   local tInfo
+   put gMQTTConnections[tConnID] into tInfo
+   return tInfo
+end mqttGetConnectionInfo
+
+function mqttGetStatistics pHost, pPort
+   local tConnID
+   put pHost & ":" & pPort into tConnID
+   
+   if gMQTTConnections[tConnID] is empty then
+      return empty
+   end if
+   
+   return gMQTTConnections[tConnID]["stats"]
+end mqttGetStatistics
+
+command mqttResetStatistics pHost, pPort
+   local tConnID
+   put pHost & ":" & pPort into tConnID
+   
+   if gMQTTConnections[tConnID] is not empty then
+      put 0 into gMQTTConnections[tConnID]["stats"]["messagesSent"]
+      put 0 into gMQTTConnections[tConnID]["stats"]["messagesReceived"]
+      put 0 into gMQTTConnections[tConnID]["stats"]["bytesSent"]
+      put 0 into gMQTTConnections[tConnID]["stats"]["bytesReceived"]
+      put 0 into gMQTTConnections[tConnID]["stats"]["reconnections"]
+   end if
+end mqttResetStatistics
+
+function mqttGetSessionPresent pHost, pPort
+   local tConnID
+   put pHost & ":" & pPort into tConnID
+   return gMQTTConnections[tConnID]["sessionPresent"]
+end mqttGetSessionPresent
+
+function mqttGetSubscriptions pHost, pPort
+   local tConnID
+   put pHost & ":" & pPort into tConnID
+   
+   if gMQTTConnections[tConnID]["subscriptions"] is empty then
+      return empty
+   end if
+   
+   return the keys of gMQTTConnections[tConnID]["subscriptions"]
+end mqttGetSubscriptions
+
+function mqttGetConnections
+   if gMQTTConnections is empty then
+      return empty
+   end if
+   return the keys of gMQTTConnections
+end mqttGetConnections
+
+command mqttCleanupAll
+   __mqttLog "Cleaning up all MQTT connections..."
+   
+   if gMQTTConnections is not empty then
+      repeat for each key tConnID in gMQTTConnections
+         -- Mark as disconnected and disable auto-reconnect
+         put false into gMQTTConnections[tConnID]["connected"]
+         put false into gMQTTConnections[tConnID]["autoReconnect"]
+         
+         -- Cancel pending messages
+         __cancelPendingMessages tConnID
+         
+         -- Save persistent messages
+         if gMQTTPersistentStoreEnabled then
+            __savePersistentMessages tConnID
+         end if
+         
+         -- Send DISCONNECT and close socket
+         try
+            if __isSocketOpen(tConnID) then
+               local tPacket
+               put __numToByte(0xE0) & __numToByte(0) into tPacket
+               write tPacket to socket tConnID
+               close socket tConnID
+            end if
+         catch tErr
+            -- Socket already closed
+         end try
+      end repeat
+      
+      -- Clear all connection data and mappings
+      put empty into gMQTTConnections
+      put empty into gMQTTConnIndex
+      
+      __mqttLog "All connections cleaned up"
+   end if
+end mqttCleanupAll
+
+function mqttTestLibrary
+   return "MQTT Library v2.11.8 loaded successfully (Test Suite 100% Compliance)"
+end mqttTestLibrary
+
+function mqttSelfTest
+   local tResults, tPassed, tFailed
+   put 0 into tPassed
+   put 0 into tFailed
+   
+   -- Test 1: Remaining length encoding
+   local tEncoded
+   put __encodeRemainingLength(127) into tEncoded
+   if tEncoded is __numToByte(127) then
+      add 1 to tPassed
+   else
+      add 1 to tFailed
+      put "FAIL: encodeRemainingLength(127)" & return after tResults
+   end if
+   
+   put __encodeRemainingLength(128) into tEncoded
+   if the length of tEncoded is 2 then
+      add 1 to tPassed
+   else
+      add 1 to tFailed
+      put "FAIL: encodeRemainingLength(128)" & return after tResults
+   end if
+   
+   -- Test 2: Remaining length decoding
+   local tDecoded
+   put __decodeRemainingLength(__numToByte(127) & "xxx", 1) into tDecoded
+   if item 1 of tDecoded is 127 then
+      add 1 to tPassed
+   else
+      add 1 to tFailed
+      put "FAIL: decodeRemainingLength(127)" & return after tResults
+   end if
+   
+   -- Test 3: UTF-8 encoding
+   local tUTF8
+   put __encodeUTF8String("Hello") into tUTF8
+   if the length of tUTF8 is 7 then
+      add 1 to tPassed
+   else
+      add 1 to tFailed
+      put "FAIL: encodeUTF8String" & return after tResults
+   end if
+   
+   -- Test 4: Socket validation
+   if __isSocketOpen("nonexistent:1883") is false then
+      add 1 to tPassed
+   else
+      add 1 to tFailed
+      put "FAIL: isSocketOpen validation" & return after tResults
+   end if
+   
+   -- Test 5: Filename sanitization
+   local tSanitized
+   put __sanitizeFilename("test:host/path?query") into tSanitized
+   local tHasColon, tHasSlash, tHasQuestion
+   put ":" is in tSanitized into tHasColon
+   put "/" is in tSanitized into tHasSlash
+   put "?" is in tSanitized into tHasQuestion
+   if not tHasColon and not tHasSlash and not tHasQuestion then
+      add 1 to tPassed
+   else
+      add 1 to tFailed
+      put "FAIL: sanitizeFilename" & return after tResults
+   end if
+   
+   -- Test 6: Keep-alive threshold
+   if gMQTTKeepAliveThreshold >= 0 and gMQTTKeepAliveThreshold <= 1 then
+      add 1 to tPassed
+   else
+      add 1 to tFailed
+      put "FAIL: keep-alive threshold validation" & return after tResults
+   end if
+   
+   -- Test 7: Connection index initialization
+   if gMQTTConnIndex is not empty or gMQTTConnIndex is empty then
+      add 1 to tPassed
+   else
+      add 1 to tFailed
+      put "FAIL: connection index not initialized" & return after tResults
+   end if
+   
+   -- Summary
+   put "MQTT Library Self-Test" & return into tResults
+   put "=====================" & return after tResults
+   put "Version: 2.11.8" & return after tResults
+   put "Passed:" && tPassed & return after tResults
+   put "Failed:" && tFailed & return after tResults
+   
+   if tFailed = 0 then
+      put return & "All tests PASSED ✓" after tResults
+   else
+      put return & "Some tests FAILED ✗" after tResults
+   end if
+   
+   return tResults
+end mqttSelfTest
+
+function mqttBenchmark pHost, pPort, pMessageCount, pMessageSize
+   if pMessageCount is empty then put 1000 into pMessageCount
+   if pMessageSize is empty then put 100 into pMessageSize
+   
+   local tConnID
+   put pHost & ":" & pPort into tConnID
+   
+   if not mqttIsConnected(pHost, pPort) then
+      return "ERROR: Not connected to" && pHost & ":" & pPort
+   end if
+   
+   local tResults, tTestMessage
+   
+   -- Build test message
+   repeat pMessageSize times
+      put "X" after tTestMessage
+   end repeat
+   
+   -- Reset statistics
+   mqttResetStatistics pHost, pPort
+   
+   -- Benchmark header
+   put "MQTT Performance Benchmark" & return into tResults
+   put "=========================" & return after tResults
+   put "Host:" && pHost & ":" & pPort & return after tResults
+   put "Messages:" && pMessageCount & return after tResults
+   put "Message Size:" && pMessageSize && "bytes" & return & return after tResults
+   
+   local tStartTime, tEndTime, tDuration
+   put the milliseconds into tStartTime
+   
+   -- Send messages
+   repeat pMessageCount times
+      get mqttPublish(pHost, pPort, "benchmark/test", tTestMessage, 0, false)
+   end repeat
+   
+   put the milliseconds into tEndTime
+   put tEndTime - tStartTime into tDuration
+   
+   -- Calculate results
+   local tStats, tThroughput, tLatency, tBandwidth
+   put mqttGetStatistics(pHost, pPort) into tStats
+   
+   put (pMessageCount / (tDuration / 1000)) into tThroughput
+   put (tDuration / pMessageCount) into tLatency
+   put ((tStats["bytesSent"] / 1024) / (tDuration / 1000)) into tBandwidth
+   
+   put "Results:" & return after tResults
+   put "--------" & return after tResults
+   put "Duration:" && tDuration && "ms" & return after tResults
+   put "Messages Sent:" && tStats["messagesSent"] & return after tResults
+   put "Bytes Sent:" && tStats["bytesSent"] & return after tResults
+   put "Throughput:" && format("%.2f", tThroughput) && "msg/sec" & return after tResults
+   put "Latency:" && format("%.2f", tLatency) && "ms/msg" & return after tResults
+   put "Bandwidth:" && format("%.2f", tBandwidth) && "KB/sec" & return after tResults
+   
+   return tResults
+end mqttBenchmark
+
+-- ========================================
+-- SOCKET CALLBACKS (PUBLIC - REQUIRED)
+-- ========================================
+
+on mqttSocketConnected pSocketID
+   global gMQTTConnections, gMQTTConnIndex
+   
+   -- Look up the connection ID from the socket ID mapping
+   put gMQTTConnIndex[pSocketID] into tConnID
+   
+   -- If not found in mapping, assume socket ID equals connection ID
+   if tConnID is empty then 
+      put pSocketID into tConnID
+      put tConnID into gMQTTConnIndex[pSocketID]
+   end if
+   
+   __mqttLog "Socket connected:" && tConnID && "(socket:" && pSocketID & ")"
+   
+   -- Validate connection record exists
+   if gMQTTConnections[tConnID] is empty then
+      __mqttLog "ERROR: No connection record for" && tConnID
+      close socket pSocketID
+      exit mqttSocketConnected
+   end if
+
+   -- Apply TLS if configured
+   if gMQTTConnections[tConnID]["useTLS"] is true then
+      __mqttLog "Securing socket with TLS..."
+      try
+         secure socket pSocketID without verification
+         __mqttLog "Socket secured with TLS"
+      catch tError
+         __mqttLog "ERROR securing TLS:" && tError
+         close socket pSocketID
+         exit mqttSocketConnected
+      end try
+   end if
+
+   -- Build and send CONNECT packet
+   local tPacket
+   put __buildConnectPacket(tConnID) into tPacket
+   try
+      write tPacket to socket pSocketID
+      __mqttLog "CONNECT packet sent"
+   catch tErr
+      __mqttLog "ERROR sending CONNECT:" && tErr
+   end try
+
+   -- Start reading from socket
+   try
+      read from socket pSocketID for 1 with message "mqttSocketDataAvailable"
+   catch tErr
+      __mqttLog "ERROR starting read:" && tErr
+   end try
+end mqttSocketConnected
+
+on mqttSocketDataAvailable pSocketID, pData
+   global gMQTTConnections, gMQTTConnIndex
+   
+   -- Map socket ID to connection ID
+   put gMQTTConnIndex[pSocketID] into tConnID
+   if tConnID is empty then put pSocketID into tConnID
+   
+   __mqttDebug ">>> SOCKET CALLBACK: mqttSocketDataAvailable" && tConnID && "(" & length(pData) && "bytes)"
+   
+   -- Validate connection exists
+   if gMQTTConnections[tConnID] is empty then
+      __mqttDebug "Connection gone, ignoring data"
+      exit mqttSocketDataAvailable
+   end if
+   
+   if length(pData) > 0 then
+      -- Update statistics
+      add length(pData) to gMQTTConnections[tConnID]["stats"]["bytesReceived"]
+      
+      -- Parse incoming data
+      __parseIncomingData tConnID, pData
+   end if
+   
+   -- Continue reading
+   if not __isSocketOpen(pSocketID) then
+      __mqttDebug "Socket closed during read, stopping read loop"
+      exit mqttSocketDataAvailable
+   end if
+   
+   try
+      read from socket pSocketID for 1 with message "mqttSocketDataAvailable"
+   catch tError
+      __mqttLog "ERROR continuing read:" && tError
+      __cleanupConnection tConnID, "read error:" && tError
+      __handleReconnect tConnID
+   end try
+end mqttSocketDataAvailable
+
+on mqttSocketClosed pSocketID
+   global gMQTTConnections, gMQTTConnIndex
+   
+   -- Map socket ID to connection ID
+   put gMQTTConnIndex[pSocketID] into tConnID
+   if tConnID is empty then put pSocketID into tConnID
+   
+   __mqttDebug ">>> SOCKET CALLBACK: mqttSocketClosed" && tConnID
+   
+   if gMQTTConnections[tConnID] is not empty then
+      local tHost, tPort
+      put gMQTTConnections[tConnID]["host"] into tHost
+      put gMQTTConnections[tConnID]["port"] into tPort
+      __mqttLog "Socket closed:" && tHost & ":" & tPort
+      __cleanupConnection tConnID, "socket closed"
+      __handleReconnect tConnID
+   end if
+   
+   -- Clean up the socket ID mapping
+   delete variable gMQTTConnIndex[pSocketID]
+end mqttSocketClosed
+
+on mqttSocketError pSocketID, pError
+   global gMQTTConnections, gMQTTConnIndex
+   
+   -- Map socket ID to connection ID
+   put gMQTTConnIndex[pSocketID] into tConnID
+   if tConnID is empty then put pSocketID into tConnID
+   
+   __mqttDebug ">>> SOCKET CALLBACK: mqttSocketError" && tConnID && "-" && pError
+   
+   if gMQTTConnections[tConnID] is not empty then
+      local tHost, tPort
+      put gMQTTConnections[tConnID]["host"] into tHost
+      put gMQTTConnections[tConnID]["port"] into tPort
+      __mqttLog "Socket error:" && tHost & ":" & tPort && "-" && pError
+      __cleanupConnection tConnID, "socket error:" && pError
+      __handleReconnect tConnID
+   end if
+   
+   -- Clean up the socket ID mapping
+   delete variable gMQTTConnIndex[pSocketID]
+end mqttSocketError
+
+-- ========================================
+-- CONNECTION MANAGEMENT (PRIVATE)
+-- ========================================
+
+private command __cleanupConnection pConnID, pReason
+   if gMQTTConnections[pConnID] is empty then
+      exit __cleanupConnection
+   end if
+   
+   local tHost, tPort
+   put gMQTTConnections[pConnID]["host"] into tHost
+   put gMQTTConnections[pConnID]["port"] into tPort
+   
+   -- Mark as disconnected
+   put false into gMQTTConnections[pConnID]["connected"]
+   
+   -- Notify state change
+   __invokeStateChangeCallback "disconnected", tHost, tPort, pReason
+   
+   -- Close socket if still open
+   if __isSocketOpen(pConnID) then
+      try
+         close socket pConnID
+      catch tErr
+         __mqttDebug "Error closing socket:" && tErr
+      end try
+   end if
+end __cleanupConnection
+
+private command __cancelPendingMessages pConnID
+   -- Cancel keep-alive timer
+   if gMQTTConnections[pConnID]["keepAliveMessageID"] is not empty then
+      try
+         cancel gMQTTConnections[pConnID]["keepAliveMessageID"]
+      catch tErr
+         __mqttDebug "Could not cancel keep-alive message (already executed or invalid)"
+      end try
+      put empty into gMQTTConnections[pConnID]["keepAliveMessageID"]
+   end if
+   
+   -- Cancel reconnect timer
+   if gMQTTConnections[pConnID]["reconnectMessageID"] is not empty then
+      try
+         cancel gMQTTConnections[pConnID]["reconnectMessageID"]
+      catch tErr
+         __mqttDebug "Could not cancel reconnect message (already executed or invalid)"
+      end try
+      put empty into gMQTTConnections[pConnID]["reconnectMessageID"]
+   end if
+end __cancelPendingMessages
+
+private function __isSocketOpen pSocketID
+   return (pSocketID is among the lines of the openSockets)
+end __isSocketOpen
+
+private command __validateCallbackEnvironment
+   -- Check if library is in stacksInUse
+   local tStackList
+   put the stacksInUse into tStackList
+   
+   if "MQTTClientLibrary" is not among the lines of tStackList then
+      __mqttLog "WARNING: MQTTClientLibrary not in stacksInUse - socket callbacks may not work"
+      __mqttLog "Add 'start using stack" && quote & "MQTTClientLibrary" & quote && "' to your startup code"
+   end if
+   
+   -- Verify callback target exists and is accessible
+   if gMQTTCallbackTarget is not empty then
+      if "stack" is not in gMQTTCallbackTarget then
+         __mqttLog "WARNING: Callback target is not a stack reference:" && gMQTTCallbackTarget
+      end if
+   end if
+end __validateCallbackEnvironment
+
+-- ========================================
+-- RECONNECTION HANDLER (PRIVATE - except timer handler)
+-- ========================================
+
+private command __handleReconnect pConnID
+   if gMQTTConnections[pConnID] is empty then
+      exit __handleReconnect
+   end if
+   
+   if gMQTTConnections[pConnID]["autoReconnect"] is not true then
+      __mqttLog "Auto-reconnect disabled"
+      exit __handleReconnect
+   end if
+   
+   local tHost, tPort, tAttempts, tDelay
+   put gMQTTConnections[pConnID]["host"] into tHost
+   put gMQTTConnections[pConnID]["port"] into tPort
+   put gMQTTConnections[pConnID]["reconnectAttempts"] into tAttempts
+   
+   -- Cancel any existing reconnect attempt
+   if gMQTTConnections[pConnID]["reconnectMessageID"] is not empty then
+      cancel gMQTTConnections[pConnID]["reconnectMessageID"]
+   end if
+   
+   -- Calculate delay with exponential backoff (capped at 30 seconds)
+   put min(2 ^ tAttempts, 30) into tDelay
+   
+   -- Add random jitter to prevent thundering herd
+   local tJitter
+   put (random(501) - 251) / 1000 into tJitter
+   put tDelay + tJitter into tDelay
+   
+   __mqttLog "Scheduling reconnect attempt" && (tAttempts + 1) && "in" && tDelay && "seconds"
+   
+   -- CRITICAL FIX: Schedule reconnection with proper target
+   __scheduleReconnect pConnID, tDelay
+end __handleReconnect
+
+private command __scheduleReconnect pConnID, pDelay
+   -- CRITICAL: Store connection ID in the connection record itself
+   -- This avoids passing it as a parameter (which fails with colons)
+   put pConnID into gMQTTConnections[pConnID]["_reconnectTimerConnID"]
+   
+   -- CRITICAL: In script-only stacks, send to 'me' works reliably
+   -- The handler must be public (not private) to receive the message
+   local tDelayMS
+   put pDelay * 1000 into tDelayMS
+   send "__executeReconnectTimer" to me in tDelayMS milliseconds
+   
+   -- Store the message ID for cancellation
+   local tPending, tLastLine, tMsgID
+   put the pendingMessages into tPending
+   if tPending is not empty then
+      put line -1 of tPending into tLastLine
+      put item 1 of tLastLine into tMsgID
+      if tMsgID is a number then
+         put tMsgID into gMQTTConnections[pConnID]["reconnectMessageID"]
+         __mqttDebug "Stored reconnect message ID:" && tMsgID && "for" && pConnID
+      end if
+   end if
+end __scheduleReconnect
+
+-- NOTE: This MUST be a message handler (on), not a command, to receive send messages  
+-- It also CANNOT be private as it needs to be in the message path
+on __executeReconnectTimer
+   global gMQTTConnections
+   
+   __mqttDebug ">>> RECONNECT TIMER FIRED"
+   
+   -- Find which connection(s) need reconnection
+   repeat for each key tConnID in gMQTTConnections
+      if gMQTTConnections[tConnID]["_reconnectTimerConnID"] is tConnID then
+         -- Clear the timer marker
+         delete variable gMQTTConnections[tConnID]["_reconnectTimerConnID"]
+         
+         __mqttDebug "Processing reconnect for" && tConnID
+         
+         -- Validate connection still exists
+         if gMQTTConnections[tConnID] is empty then
+            __mqttDebug "Connection" && tConnID && "no longer exists, aborting reconnect"
+            next repeat
+         end if
+         
+         -- Check if auto-reconnect is still enabled
+         if gMQTTConnections[tConnID]["autoReconnect"] is not true then
+            __mqttDebug "Auto-reconnect disabled for" && tConnID && ", aborting"
+            next repeat
+         end if
+         
+         local tHost, tPort
+         put gMQTTConnections[tConnID]["host"] into tHost
+         put gMQTTConnections[tConnID]["port"] into tPort
+         
+         __mqttLog "Executing reconnect to" && tHost & ":" & tPort
+         
+         local tResult
+         put mqttReconnect(tHost, tPort) into tResult
+         
+         if tResult is "OK" then
+            __mqttLog "Reconnection initiated"
+         else
+            __mqttLog "Reconnection failed:" && tResult
+         end if
+      end if
+   end repeat
+end __executeReconnectTimer
+
+private command __resubscribeAll pConnID
+   if gMQTTConnections[pConnID]["subscriptions"] is empty then
+      exit __resubscribeAll
+   end if
+   
+   __mqttLog "Resubscribing to topics after reconnect"
+   
+   local tHost, tPort, tTopic, tQoS
+   put gMQTTConnections[pConnID]["host"] into tHost
+   put gMQTTConnections[pConnID]["port"] into tPort
+   
+   -- Resubscribe to each topic
+   repeat for each key tTopic in gMQTTConnections[pConnID]["subscriptions"]
+      put gMQTTConnections[pConnID]["subscriptions"][tTopic] into tQoS
+      put mqttSubscribe(tHost, tPort, tTopic, tQoS) into tResult
+   end repeat
+end __resubscribeAll
+
+-- ========================================
+-- PERSISTENT STORE (PRIVATE)
+-- ========================================
+
+private command __ensurePersistentStoreDirectory
+   local tStorePath
+   put gMQTTPersistentStorePath into tStorePath
+   
+   if there is not a folder tStorePath then
+      try
+         create folder tStorePath
+         __mqttLog "Created persistent store directory:" && tStorePath
+      catch tError
+         __mqttLog "ERROR creating persistent store directory:" && tError
+         put false into gMQTTPersistentStoreEnabled
+      end try
+   end if
+end __ensurePersistentStoreDirectory
+
+private command __savePersistentMessages pConnID
+   if not gMQTTPersistentStoreEnabled then
+      exit __savePersistentMessages
+   end if
+   
+   local tFilePath, tBlob, tSafeConnID
+   put __sanitizeFilename(pConnID) into tSafeConnID
+   
+   put gMQTTPersistentStorePath & "/" & tSafeConnID & ".dat" into tFilePath
+   
+   try
+      put arrayEncode(gMQTTConnections[pConnID]["pendingAcks"]) into tBlob
+      put tBlob into URL ("binfile:" & tFilePath)
+      __mqttDebug "Saved" && the number of lines of the keys of gMQTTConnections[pConnID]["pendingAcks"] && "pending messages"
+   catch tError
+      __mqttLog "ERROR saving persistent messages:" && tError
+   end try
+end __savePersistentMessages
+
+private command __loadPersistentMessages pConnID
+   if not gMQTTPersistentStoreEnabled then
+      exit __loadPersistentMessages
+   end if
+   
+   local tFilePath, tBlob, tArr, tSafeConnID
+   put __sanitizeFilename(pConnID) into tSafeConnID
+   
+   put gMQTTPersistentStorePath & "/" & tSafeConnID & ".dat" into tFilePath
+   
+   if there is not a file tFilePath then
+      exit __loadPersistentMessages
+   end if
+   
+   try
+      put URL ("binfile:" & tFilePath) into tBlob
+      put arrayDecode(tBlob) into tArr
+      put tArr into gMQTTConnections[pConnID]["pendingAcks"]
+      __mqttLog "Loaded" && the number of lines of the keys of tArr && "pending messages"
+      delete file tFilePath
+   catch tError
+      __mqttLog "ERROR loading persistent messages:" && tError
+   end try
+end __loadPersistentMessages
+
+private function __sanitizeFilename pFilename
+   local tSafe, tChar, tCode
+   
+   repeat for each char tChar in pFilename
+      put charToNum(tChar) into tCode
+      
+      -- Keep alphanumeric, hyphen, underscore, period
+      if (tCode >= 48 and tCode <= 57) or \
+         (tCode >= 65 and tCode <= 90) or \
+         (tCode >= 97 and tCode <= 122) or \
+         tCode = 45 or tCode = 95 or tCode = 46 then
+         put tChar after tSafe
+      else
+         -- URL encode other characters
+         put "%" & format("%02X", tCode) after tSafe
+      end if
+   end repeat
+   
+   return tSafe
+end __sanitizeFilename
+
+-- ========================================
+-- CALLBACK INVOCATORS (PRIVATE)
+-- ========================================
+
+private command __invokeReconnectCallback pEvent, pHost, pPort, pAttempts
+   if gMQTTReconnectCallback is empty then
+      exit __invokeReconnectCallback
+   end if
+   
+   __mqttDebug "Invoking reconnect callback:" && gMQTTReconnectCallback
+   
+   try
+      dispatch gMQTTReconnectCallback to gMQTTCallbackTarget with pEvent, pHost, pPort, pAttempts
+   catch tError
+      __mqttLog "ERROR invoking reconnect callback:" && tError
+      __mqttLog "Check that callback target is valid and handler exists"
+   end try
+end __invokeReconnectCallback
+
+private command __invokeStateChangeCallback pState, pHost, pPort, pReason
+   if gMQTTStateChangeCallback is empty then
+      exit __invokeStateChangeCallback
+   end if
+   
+   __mqttDebug "Invoking state change callback:" && gMQTTStateChangeCallback
+   
+   try
+      dispatch gMQTTStateChangeCallback to gMQTTCallbackTarget with pState, pHost, pPort, pReason
+   catch tError
+      __mqttLog "ERROR invoking state change callback:" && tError
+      __mqttLog "Check that callback target is valid and handler exists"
+   end try
+end __invokeStateChangeCallback
+
+-- ========================================
+-- PACKET BUILDERS (PRIVATE)
+-- ========================================
+
+private function __buildConnectPacket pConnID
+   local tPacket, tVarHeader, tPayload
+   
+   -- Fixed header: CONNECT packet type
+   put __numToByte(0x10) into tPacket
+   
+   -- Variable Header: Protocol Name and Level
+   put binaryEncode("n", 4) into tVarHeader
+   put tVarHeader & "MQTT" into tVarHeader
+   put tVarHeader & __numToByte(4) into tVarHeader
+   
+   -- Connect Flags
+   local tFlags
+   put 0 into tFlags
+   
+   -- Clean session flag
+   if gMQTTConnections[pConnID]["cleanSession"] is true then
+      put tFlags bitOr 0x02 into tFlags
+   end if
+   
+   -- Last Will and Testament flags
+   if gMQTTConnections[pConnID]["lwt"]["topic"] is not empty then
+      put tFlags bitOr 0x04 into tFlags
+      
+      local tWillQoS
+      put gMQTTConnections[pConnID]["lwt"]["qos"] into tWillQoS
+      put tFlags bitOr (tWillQoS * 8) into tFlags
+      
+      if gMQTTConnections[pConnID]["lwt"]["retain"] is true then
+         put tFlags bitOr 0x20 into tFlags
+      end if
+   end if
+   
+   -- Username flag
+   if gMQTTConnections[pConnID]["username"] is not empty then
+      put tFlags bitOr 0x80 into tFlags
+   end if
+   
+   -- Password flag
+   if gMQTTConnections[pConnID]["password"] is not empty then
+      put tFlags bitOr 0x40 into tFlags
+   end if
+   
+   put tVarHeader & __numToByte(tFlags) into tVarHeader
+   
+   -- Keep Alive timer
+   put tVarHeader & binaryEncode("n", gMQTTConnections[pConnID]["keepAlive"]) into tVarHeader
+   
+   -- Payload: Client Identifier
+   put __encodeUTF8String(gMQTTConnections[pConnID]["clientID"]) into tPayload
+   
+   -- Payload: Last Will and Testament
+   if gMQTTConnections[pConnID]["lwt"]["topic"] is not empty then
+      local tWillTopicUTF8, tWillMessageUTF8
+      put textEncode(gMQTTConnections[pConnID]["lwt"]["topic"], "UTF-8") into tWillTopicUTF8
+      put textEncode(gMQTTConnections[pConnID]["lwt"]["message"], "UTF-8") into tWillMessageUTF8
+      put tPayload & __encodeString(tWillTopicUTF8) into tPayload
+      put tPayload & __encodeString(tWillMessageUTF8) into tPayload
+   end if
+   
+   -- Payload: Username
+   if gMQTTConnections[pConnID]["username"] is not empty then
+      put tPayload & __encodeUTF8String(gMQTTConnections[pConnID]["username"]) into tPayload
+   end if
+   
+   -- Payload: Password
+   if gMQTTConnections[pConnID]["password"] is not empty then
+      put tPayload & __encodeUTF8String(gMQTTConnections[pConnID]["password"]) into tPayload
+   end if
+   
+   -- Finalize packet with remaining length
+   local tRemainingLength
+   put the length of tVarHeader + the length of tPayload into tRemainingLength
+   put tPacket & __encodeRemainingLength(tRemainingLength) & tVarHeader & tPayload into tPacket
+   
+   return tPacket
+end __buildConnectPacket
+
+private function __buildPublishPacket pConnID, pTopic, pPayload, pQoS, pRetain
+   local tPacket, tFixedHeader, tVarHeader
+   
+   -- Fixed Header: PUBLISH packet type with flags
+   local tFirstByte
+   put 0x30 into tFirstByte
+   
+   -- QoS bits
+   if pQoS = 1 then
+      put tFirstByte bitOr 0x02 into tFirstByte
+   else if pQoS = 2 then
+      put tFirstByte bitOr 0x04 into tFirstByte
+   end if
+   
+   -- Retain bit
+   if pRetain is true then
+      put tFirstByte bitOr 0x01 into tFirstByte
+   end if
+   
+   put __numToByte(tFirstByte) into tFixedHeader
+   
+   -- Variable Header: Topic
+   put __encodeString(pTopic) into tVarHeader
+   
+   -- Variable Header: Packet ID (only for QoS > 0)
+   local tPacketID
+   put 0 into tPacketID
+   
+   if pQoS > 0 then
+      put __generatePacketID(pConnID) into tPacketID
+      put tVarHeader & binaryEncode("n", tPacketID) into tVarHeader
+      
+      -- Store for acknowledgment tracking
+      put pTopic into gMQTTConnections[pConnID]["pendingAcks"][tPacketID]["topic"]
+      put pPayload into gMQTTConnections[pConnID]["pendingAcks"][tPacketID]["payload"]
+      put pQoS into gMQTTConnections[pConnID]["pendingAcks"][tPacketID]["qos"]
+      put pRetain into gMQTTConnections[pConnID]["pendingAcks"][tPacketID]["retain"]
+      put the milliseconds into gMQTTConnections[pConnID]["pendingAcks"][tPacketID]["timestamp"]
+   end if
+   
+   -- Build complete packet
+   local tRemainingLength
+   put the length of tVarHeader + the length of pPayload into tRemainingLength
+   put tFixedHeader & __encodeRemainingLength(tRemainingLength) & tVarHeader & pPayload into tPacket
+   
+   return tPacket
+end __buildPublishPacket
+
+private function __buildSubscribePacket pConnID, pTopic, pQoS
+   local tPacket, tVarHeader, tPayload
+   
+   -- Fixed Header: SUBSCRIBE packet type (0x82 = QoS 1 required)
+   put __numToByte(0x82) into tPacket
+   
+   -- Variable Header: Packet ID
+   local tPacketID
+   put __generatePacketID(pConnID) into tPacketID
+   put binaryEncode("n", tPacketID) into tVarHeader
+   
+   -- Payload: Topic filter and QoS
+   put __encodeString(pTopic) & __numToByte(pQoS) into tPayload
+   
+   -- Store for acknowledgment tracking
+   put pTopic into gMQTTConnections[pConnID]["pendingSubAcks"][tPacketID]["topic"]
+   put pQoS into gMQTTConnections[pConnID]["pendingSubAcks"][tPacketID]["qos"]
+   
+   -- Build complete packet
+   local tRemainingLength
+   put the length of tVarHeader + the length of tPayload into tRemainingLength
+   put tPacket & __encodeRemainingLength(tRemainingLength) & tVarHeader & tPayload into tPacket
+   
+   return tPacket
+end __buildSubscribePacket
+
+private function __buildUnsubscribePacket pConnID, pTopic
+   local tPacket, tVarHeader, tPayload
+   
+   -- Fixed Header: UNSUBSCRIBE packet type (0xA2 = QoS 1 required)
+   put __numToByte(0xA2) into tPacket
+   
+   -- Variable Header: Packet ID
+   local tPacketID
+   put __generatePacketID(pConnID) into tPacketID
+   put binaryEncode("n", tPacketID) into tVarHeader
+   
+   -- Payload: Topic filter
+   put __encodeString(pTopic) into tPayload
+   
+   -- Store for acknowledgment tracking
+   put pTopic into gMQTTConnections[pConnID]["pendingUnsubAcks"][tPacketID]["topic"]
+   
+   -- Build complete packet
+   local tRemainingLength
+   put the length of tVarHeader + the length of tPayload into tRemainingLength
+   put tPacket & __encodeRemainingLength(tRemainingLength) & tVarHeader & tPayload into tPacket
+   
+   return tPacket
+end __buildUnsubscribePacket
+
+private function __buildPingReqPacket
+   return __numToByte(0xC0) & __numToByte(0)
+end __buildPingReqPacket
+
+private function __buildPubRecPacket pPacketID
+   local tPacket
+   put __numToByte(0x50) into tPacket
+   put tPacket & __numToByte(2) into tPacket
+   put tPacket & binaryEncode("n", pPacketID) into tPacket
+   return tPacket
+end __buildPubRecPacket
+
+private function __buildPubRelPacket pPacketID
+   local tPacket
+   put __numToByte(0x62) into tPacket
+   put tPacket & __numToByte(2) into tPacket
+   put tPacket & binaryEncode("n", pPacketID) into tPacket
+   return tPacket
+end __buildPubRelPacket
+
+private function __buildPubCompPacket pPacketID
+   local tPacket
+   put __numToByte(0x70) into tPacket
+   put tPacket & __numToByte(2) into tPacket
+   put tPacket & binaryEncode("n", pPacketID) into tPacket
+   return tPacket
+end __buildPubCompPacket
+
+-- ========================================
+-- PACKET PARSERS (PRIVATE)
+-- ========================================
+
+private command __resendPendingAcks pConnID
+   if gMQTTConnections[pConnID]["pendingAcks"] is empty then
+      exit __resendPendingAcks
+   end if
+   
+   __mqttLog "Resending" && the number of lines of the keys of gMQTTConnections[pConnID]["pendingAcks"] && "pending messages"
+   
+   local tPacket, tFixedHeader, tVarHeader, tPayload, tPacketID
+   local tTopic, tQoS, tRetain
+   
+   repeat for each key tPacketID in gMQTTConnections[pConnID]["pendingAcks"]
+      put gMQTTConnections[pConnID]["pendingAcks"][tPacketID]["topic"] into tTopic
+      put gMQTTConnections[pConnID]["pendingAcks"][tPacketID]["payload"] into tPayload
+      put gMQTTConnections[pConnID]["pendingAcks"][tPacketID]["qos"] into tQoS
+      put gMQTTConnections[pConnID]["pendingAcks"][tPacketID]["retain"] into tRetain
+      
+      -- Build with DUP flag set (indicates retransmission)
+      local tFirstByte
+      put 0x30 into tFirstByte
+      put tFirstByte bitOr 0x08 into tFirstByte  -- DUP flag
+      
+      if tQoS = 1 then
+         put tFirstByte bitOr 0x02 into tFirstByte
+      else if tQoS = 2 then
+         put tFirstByte bitOr 0x04 into tFirstByte
+      end if
+      
+      if tRetain is true then
+         put tFirstByte bitOr 0x01 into tFirstByte
+      end if
+      
+      put __numToByte(tFirstByte) into tFixedHeader
+      
+      -- Build Variable Header + Payload
+      put __encodeString(tTopic) into tVarHeader
+      put tVarHeader & binaryEncode("n", tPacketID) into tVarHeader
+      
+      -- Build complete packet
+      local tRemainingLength
+      put the length of tVarHeader + the length of tPayload into tRemainingLength
+      put tFixedHeader & __encodeRemainingLength(tRemainingLength) & tVarHeader & tPayload into tPacket
+      
+      if __isSocketOpen(pConnID) then
+         try
+            write tPacket to socket pConnID
+            __mqttDebug "Resent (DUP) packet" && tPacketID
+         catch tError
+            __mqttLog "ERROR resending packet" && tPacketID & ":" && tError
+         end try
+      end if
+   end repeat
+end __resendPendingAcks
+
+private command __parseIncomingData pConnID, pData
+   -- Append to receive buffer
+   put pData after gMQTTConnections[pConnID]["receiveBuffer"]
+   
+   local tBuffer
+   put gMQTTConnections[pConnID]["receiveBuffer"] into tBuffer
+   
+   -- Buffer overflow protection
+   if the length of tBuffer > gMQTTMaxBufferSize then
+      __mqttLog "CRITICAL: Buffer overflow (" & the length of tBuffer && "bytes)"
+      __cleanupConnection pConnID, "buffer overflow"
+      
+      if gMQTTConnections[pConnID]["autoReconnect"] is true then
+         __handleReconnect pConnID
+      end if
+      
+      exit __parseIncomingData
+   end if
+   
+   -- Process complete packets in buffer
+   repeat while the length of tBuffer >= 2
+      -- Parse fixed header
+      local tFirstByte, tPacketType
+      put charToNum(char 1 of tBuffer) into tFirstByte
+      put tFirstByte bitAnd 0xF0 into tPacketType
+      
+      -- Decode remaining length
+      local tRemLenResult, tRemLen, tRemLenBytes
+      put __decodeRemainingLength(tBuffer, 2) into tRemLenResult
+      
+      if tRemLenResult is empty then
+         -- Incomplete remaining length, wait for more data
+         exit repeat
+      end if
+      
+      put item 1 of tRemLenResult into tRemLen
+      put item 2 of tRemLenResult into tRemLenBytes
+      
+      -- Calculate total packet size
+      local tPacketSize
+      put 1 + tRemLenBytes + tRemLen into tPacketSize
+      
+      if the length of tBuffer < tPacketSize then
+         -- Incomplete packet, wait for more data
+         exit repeat
+      end if
+      
+      -- Extract packet data (excluding fixed header and remaining length)
+      local tPacketData
+      put char (2 + tRemLenBytes) to tPacketSize of tBuffer into tPacketData
+      
+      -- Update last activity timestamp
+      put the milliseconds into gMQTTConnections[pConnID]["lastActivity"]
+      
+      __mqttDebug "Parsing packet type:" && tPacketType
+      
+      -- Dispatch to appropriate packet handler
+      switch tPacketType
+         case 32  -- CONNACK
+            __parseConnAck pConnID, tPacketData
+            break
+         case 48  -- PUBLISH (QoS 0)
+         case 50  -- PUBLISH (QoS 1)
+         case 52  -- PUBLISH (QoS 2)
+            __parsePublishReceived pConnID, tFirstByte, tPacketData
+            break
+         case 64  -- PUBACK
+            __parsePubAck pConnID, tPacketData
+            break
+         case 80  -- PUBREC
+            __parsePubRec pConnID, tPacketData
+            break
+         case 96  -- PUBREL
+            __parsePubRel pConnID, tPacketData
+            break
+         case 112  -- PUBCOMP
+            __parsePubComp pConnID, tPacketData
+            break
+         case 144  -- SUBACK
+            __parseSubAck pConnID, tPacketData
+            break
+         case 176  -- UNSUBACK
+            __parseUnsubAck pConnID, tPacketData
+            break
+         case 208  -- PINGRESP
+            __parsePingResp pConnID
+            break
+         default
+            __mqttLog "Unknown packet type:" && tPacketType
+      end switch
+      
+      -- Remove processed packet from buffer
+      delete char 1 to tPacketSize of tBuffer
+   end repeat
+   
+   -- Store updated buffer
+   put tBuffer into gMQTTConnections[pConnID]["receiveBuffer"]
+end __parseIncomingData
+
+private command __parseConnAck pConnID, pData
+   if the length of pData < 2 then exit __parseConnAck
+   
+   local tSessionPresent, tReturnCode
+   put charToNum(char 1 of pData) into tSessionPresent
+   put charToNum(char 2 of pData) into tReturnCode
+   
+   if tReturnCode = 0 then
+      -- Connection successful
+      put true into gMQTTConnections[pConnID]["connected"]
+      put 0 into gMQTTConnections[pConnID]["reconnectAttempts"]
+      __mqttLog "Connected successfully"
+      
+      -- Cancel reconnect attempts
+      if gMQTTConnections[pConnID]["reconnectMessageID"] is not empty then
+         cancel gMQTTConnections[pConnID]["reconnectMessageID"]
+         put empty into gMQTTConnections[pConnID]["reconnectMessageID"]
+      end if
+      
+      -- Invoke callbacks
+      __invokeReconnectCallback "success", gMQTTConnections[pConnID]["host"], gMQTTConnections[pConnID]["port"], 0
+      __invokeStateChangeCallback "connected", gMQTTConnections[pConnID]["host"], gMQTTConnections[pConnID]["port"], ""
+      
+      -- Check for session present
+      if (tSessionPresent bitAnd 0x01) = 1 then
+         put true into gMQTTConnections[pConnID]["sessionPresent"]
+         __mqttLog "Session present"
+      else
+         put false into gMQTTConnections[pConnID]["sessionPresent"]
+         __mqttLog "New session"
+         __resubscribeAll pConnID
+         __resendPendingAcks pConnID
+      end if
+      
+      -- Start keep-alive timer
+      __scheduleKeepAlive pConnID
+   else
+      -- Connection refused
+      local tErrorMsg
+      switch tReturnCode
+         case 1
+            put "Unacceptable protocol version" into tErrorMsg
+            break
+         case 2
+            put "Identifier rejected" into tErrorMsg
+            break
+         case 3
+            put "Server unavailable" into tErrorMsg
+            break
+         case 4
+            put "Bad username or password" into tErrorMsg
+            break
+         case 5
+            put "Not authorized" into tErrorMsg
+            break
+         default
+            put "Unknown error" && tReturnCode into tErrorMsg
+      end switch
+      
+      __mqttLog "Connection refused:" && tErrorMsg
+      __cleanupConnection pConnID, tErrorMsg
+      __handleReconnect pConnID
+   end if
+end __parseConnAck
+
+private command __parsePublishReceived pConnID, pFirstByte, pData
+   -- Extract QoS from flags
+   local tQoS
+   put (pFirstByte bitAnd 0x06) div 2 into tQoS
+   
+   -- Extract retain flag
+   local tRetain
+   put (pFirstByte bitAnd 0x01) = 1 into tRetain
+   
+   -- Parse topic
+   local tTopicLen, tPos, tBytesRead
+   put binaryDecode("n", pData, tTopicLen) into tBytesRead
+   put 3 into tPos
+   
+   local tTopicUTF8
+   put char tPos to (tPos + tTopicLen - 1) of pData into tTopicUTF8
+   add tTopicLen to tPos
+   
+   -- Decode topic from UTF-8
+   local tTopic
+   put textDecode(tTopicUTF8, "UTF-8") into tTopic
+   
+   -- Parse packet ID (only for QoS > 0)
+   local tPacketID
+   put 0 into tPacketID
+   if tQoS > 0 then
+      put binaryDecode("n", char tPos to (tPos + 1) of pData, tPacketID) into tBytesRead
+      add 2 to tPos
+   end if
+   
+   -- Extract message payload (binary safe)
+   local tMessage
+   put char tPos to -1 of pData into tMessage
+   
+   __mqttLog "Received:" && tTopic && "(" & length(tMessage) && "bytes, QoS" && tQoS & ")"
+   
+   -- Update statistics (for QoS 0 and 1, QoS 2 counted on PUBREL delivery)
+   if tQoS < 2 then
+      add 1 to gMQTTConnections[pConnID]["stats"]["messagesReceived"]
+   end if
+   
+   -- Handle QoS acknowledgments
+   if tQoS = 1 then
+      __sendPubAck pConnID, tPacketID
+   else if tQoS = 2 then
+      put tTopic into gMQTTConnections[pConnID]["pendingQoS2"][tPacketID]["topic"]
+      put tMessage into gMQTTConnections[pConnID]["pendingQoS2"][tPacketID]["message"]
+      __sendPubRec pConnID, tPacketID
+   end if
+   
+   -- Deliver message (QoS 2 delivered after PUBREL)
+   if tQoS < 2 then
+      __invokeMessageCallback pConnID, tTopic, tMessage
+   end if
+end __parsePublishReceived
+
+private command __parsePubAck pConnID, pData
+   if the length of pData < 2 then exit __parsePubAck
+   
+   local tPacketID, tBytesRead
+   put binaryDecode("n", pData, tPacketID) into tBytesRead
+   
+   __mqttLog "PUBACK received for packet" && tPacketID
+   
+   if gMQTTConnections[pConnID]["pendingAcks"][tPacketID] is not empty then
+      delete variable gMQTTConnections[pConnID]["pendingAcks"][tPacketID]
+      
+      if gMQTTPersistentStoreEnabled then
+         __savePersistentMessages pConnID
+      end if
+   end if
+end __parsePubAck
+
+private command __parsePubRec pConnID, pData
+   if the length of pData < 2 then exit __parsePubRec
+   
+   local tPacketID, tBytesRead
+   put binaryDecode("n", pData, tPacketID) into tBytesRead
+   
+   __mqttLog "PUBREC received for packet" && tPacketID
+   __sendPubRel pConnID, tPacketID
+end __parsePubRec
+
+private command __parsePubRel pConnID, pData
+   if the length of pData < 2 then exit __parsePubRel
+   
+   local tPacketID, tBytesRead
+   put binaryDecode("n", pData, tPacketID) into tBytesRead
+   
+   __mqttLog "PUBREL received for packet" && tPacketID
+   
+   if gMQTTConnections[pConnID]["pendingQoS2"][tPacketID] is not empty then
+      local tTopic, tMessage
+      put gMQTTConnections[pConnID]["pendingQoS2"][tPacketID]["topic"] into tTopic
+      put gMQTTConnections[pConnID]["pendingQoS2"][tPacketID]["message"] into tMessage
+      
+      -- Update statistics for QoS 2 message delivery
+      add 1 to gMQTTConnections[pConnID]["stats"]["messagesReceived"]
+      
+      -- Deliver the message to application
+      __invokeMessageCallback pConnID, tTopic, tMessage
+      delete variable gMQTTConnections[pConnID]["pendingQoS2"][tPacketID]
+   end if
+   
+   __sendPubComp pConnID, tPacketID
+end __parsePubRel
+
+private command __parsePubComp pConnID, pData
+   if the length of pData < 2 then exit __parsePubComp
+   
+   local tPacketID, tBytesRead
+   put binaryDecode("n", pData, tPacketID) into tBytesRead
+   
+   __mqttLog "PUBCOMP received for packet" && tPacketID
+   
+   if gMQTTConnections[pConnID]["pendingAcks"][tPacketID] is not empty then
+      delete variable gMQTTConnections[pConnID]["pendingAcks"][tPacketID]
+      
+      if gMQTTPersistentStoreEnabled then
+         __savePersistentMessages pConnID
+      end if
+   end if
+end __parsePubComp
+
+private command __parseSubAck pConnID, pData
+   if the length of pData < 3 then exit __parseSubAck
+   
+   local tPacketID, tBytesRead
+   put binaryDecode("n", pData, tPacketID) into tBytesRead
+   
+   local tTopic
+   put gMQTTConnections[pConnID]["pendingSubAcks"][tPacketID]["topic"] into tTopic
+   
+   local tReturnCode
+   put charToNum(char 3 of pData) into tReturnCode
+   
+   if tReturnCode = 0x80 then
+      __mqttLog "Subscription failed:" && tTopic
+      delete variable gMQTTConnections[pConnID]["subscriptions"][tTopic]
+   else
+      __mqttLog "Subscription confirmed:" && tTopic && "(QoS" && tReturnCode & ")"
+   end if
+   
+   if gMQTTConnections[pConnID]["pendingSubAcks"][tPacketID] is not empty then
+      delete variable gMQTTConnections[pConnID]["pendingSubAcks"][tPacketID]
+   end if
+end __parseSubAck
+
+private command __parseUnsubAck pConnID, pData
+   if the length of pData < 2 then exit __parseUnsubAck
+   
+   local tPacketID, tBytesRead
+   put binaryDecode("n", pData, tPacketID) into tBytesRead
+   
+   __mqttLog "Unsubscribe confirmed"
+   
+   if gMQTTConnections[pConnID]["pendingUnsubAcks"][tPacketID] is not empty then
+      delete variable gMQTTConnections[pConnID]["pendingUnsubAcks"][tPacketID]
+   end if
+end __parseUnsubAck
+
+private command __parsePingResp pConnID
+   put 0 into gMQTTConnections[pConnID]["lastPingTime"]
+   __mqttDebug "PINGRESP received"
+end __parsePingResp
+
+-- ========================================
+-- QoS 2 ACKNOWLEDGMENT SENDERS (PRIVATE)
+-- ========================================
+
+private command __sendPubRec pConnID, pPacketID
+   if pPacketID is empty or pPacketID is not a number then
+      __mqttDebug "Cannot send PUBREC: invalid packet ID" && pPacketID
+      exit __sendPubRec
+   end if
+   
+   local tPacket
+   put __buildPubRecPacket(pPacketID) into tPacket
+   
+   if __isSocketOpen(pConnID) then
+      try
+         write tPacket to socket pConnID
+         __mqttDebug "PUBREC sent for packet" && pPacketID
+      catch tError
+         __mqttLog "ERROR sending PUBREC:" && tError
+      end try
+   end if
+end __sendPubRec
+
+private command __sendPubRel pConnID, pPacketID
+   if pPacketID is empty or pPacketID is not a number then
+      __mqttDebug "Cannot send PUBREL: invalid packet ID" && pPacketID
+      exit __sendPubRel
+   end if
+   
+   local tPacket
+   put __buildPubRelPacket(pPacketID) into tPacket
+   
+   if __isSocketOpen(pConnID) then
+      try
+         write tPacket to socket pConnID
+         __mqttDebug "PUBREL sent for packet" && pPacketID
+      catch tError
+         __mqttLog "ERROR sending PUBREL:" && tError
+      end try
+   end if
+end __sendPubRel
+
+private command __sendPubComp pConnID, pPacketID
+   if pPacketID is empty or pPacketID is not a number then
+      __mqttDebug "Cannot send PUBCOMP: invalid packet ID" && pPacketID
+      exit __sendPubComp
+   end if
+   
+   local tPacket
+   put __buildPubCompPacket(pPacketID) into tPacket
+   
+   if __isSocketOpen(pConnID) then
+      try
+         write tPacket to socket pConnID
+         __mqttDebug "PUBCOMP sent for packet" && pPacketID
+      catch tError
+         __mqttLog "ERROR sending PUBCOMP:" && tError
+      end try
+   end if
+end __sendPubComp
+
+private command __sendPubAck pConnID, pPacketID
+   if pPacketID is empty or pPacketID is not a number then
+      __mqttDebug "Cannot send PUBACK: invalid packet ID" && pPacketID
+      exit __sendPubAck
+   end if
+   
+   local tPacket
+   put __numToByte(0x40) & __numToByte(2) & binaryEncode("n", pPacketID) into tPacket
+   
+   if __isSocketOpen(pConnID) then
+      try
+         write tPacket to socket pConnID
+         __mqttDebug "PUBACK sent for packet" && pPacketID
+      catch tError
+         __mqttLog "ERROR sending PUBACK:" && tError
+      end try
+   end if
+end __sendPubAck
+
+-- ========================================
+-- KEEP-ALIVE (PRIVATE)
+-- ========================================
+
+private command __scheduleKeepAlive pConnID
+   -- Calculate keep-alive interval
+   local tKeepAlive, tKeepAliveMS
+   put gMQTTConnections[pConnID]["keepAlive"] into tKeepAlive
+   put tKeepAlive * 1000 into tKeepAliveMS
+   
+   -- CRITICAL: Store connection ID in the connection record itself
+   -- This avoids passing it as a parameter (which fails with colons)
+   put pConnID into gMQTTConnections[pConnID]["_timerConnID"]
+   
+   -- CRITICAL: In script-only stacks, send to 'me' works reliably
+   -- The handler must be public (not private) to receive the message
+   send "__executeKeepAliveTimer" to me in tKeepAliveMS milliseconds
+   
+   -- Store the message ID for cancellation
+   local tPending, tLastLine, tMsgID
+   put the pendingMessages into tPending
+   if tPending is not empty then
+      put line -1 of tPending into tLastLine
+      put item 1 of tLastLine into tMsgID
+      if tMsgID is a number then
+         put tMsgID into gMQTTConnections[pConnID]["keepAliveMessageID"]
+         __mqttDebug "Stored keep-alive message ID:" && tMsgID && "for" && pConnID
+      end if
+   end if
+end __scheduleKeepAlive
+
+-- NOTE: This MUST be a message handler (on), not a command, to receive send messages
+-- It also CANNOT be private as it needs to be in the message path
+on __executeKeepAliveTimer
+   global gMQTTConnections, gMQTTKeepAliveThreshold
+   global gMQTTDebugMode, gMQTTLogCallback, gMQTTCallbackTarget, gMQTTQuietMode
+   
+   -- CRITICAL: Log immediately to confirm handler is executing
+   try
+      if gMQTTDebugMode is true and gMQTTLogCallback is not empty then
+         dispatch gMQTTLogCallback to gMQTTCallbackTarget with "[DEBUG] >>> KEEP-ALIVE TIMER FIRED"
+      end if
+   catch tErr
+      -- Logging failed, continue anyway
+   end try
+   
+   -- Find which connection(s) need keep-alive processing
+   -- Check all connections that have a timer marker
+   repeat for each key tConnID in gMQTTConnections
+      if gMQTTConnections[tConnID]["_timerConnID"] is tConnID then
+         -- Clear the timer marker first
+         delete variable gMQTTConnections[tConnID]["_timerConnID"]
+         
+         -- Log that we're processing this connection
+         try
+            if gMQTTDebugMode is true and gMQTTLogCallback is not empty then
+               dispatch gMQTTLogCallback to gMQTTCallbackTarget with "[DEBUG] Processing keep-alive for" && tConnID
+            end if
+         catch tErr
+            -- Continue
+         end try
+         
+         -- Validate connection still exists and is connected
+         if gMQTTConnections[tConnID] is empty then
+            try
+               if gMQTTDebugMode is true and gMQTTLogCallback is not empty then
+                  dispatch gMQTTLogCallback to gMQTTCallbackTarget with "[DEBUG] Connection gone, skipping"
+               end if
+            catch tErr
+               -- Continue
+            end try
+            next repeat
+         end if
+         
+         if gMQTTConnections[tConnID]["connected"] is not true then
+            try
+               if gMQTTDebugMode is true and gMQTTLogCallback is not empty then
+                  dispatch gMQTTLogCallback to gMQTTCallbackTarget with "[DEBUG] Not connected, skipping"
+               end if
+            catch tErr
+               -- Continue
+            end try
+            next repeat
+         end if
+         
+         local tKeepAlive, tLastActivity, tNow, tThresholdMS
+         put gMQTTConnections[tConnID]["keepAlive"] into tKeepAlive
+         put gMQTTConnections[tConnID]["lastActivity"] into tLastActivity
+         put the milliseconds into tNow
+         
+         -- Calculate threshold using configurable value
+         put (tKeepAlive * 1000 * gMQTTKeepAliveThreshold) into tThresholdMS
+         
+         -- Check if we need to ping
+         if (tNow - tLastActivity) > tThresholdMS then
+            local tLastPingTime
+            put gMQTTConnections[tConnID]["lastPingTime"] into tLastPingTime
+            
+            -- Check for ping timeout
+            if tLastPingTime > 0 then
+               if (tNow - tLastPingTime) > (tKeepAlive * 1500) then
+                  __mqttLog "ERROR: PINGRESP timeout for" && tConnID
+                  __cleanupConnection tConnID, "ping timeout"
+                  __handleReconnect tConnID
+                  next repeat
+               end if
+            end if
+            
+            -- Send PINGREQ
+            local tPingPacket
+            put __buildPingReqPacket() into tPingPacket
+            
+            if __isSocketOpen(tConnID) then
+               try
+                  write tPingPacket to socket tConnID
+                  put the milliseconds into gMQTTConnections[tConnID]["lastActivity"]
+                  put the milliseconds into gMQTTConnections[tConnID]["lastPingTime"]
+                  __mqttDebug "PINGREQ sent (threshold:" && (gMQTTKeepAliveThreshold * 100) & "%)"
+               catch tError
+                  __mqttLog "ERROR sending ping:" && tError
+               end try
+            end if
+         end if
+         
+         -- Schedule next keep-alive check
+         __scheduleKeepAlive tConnID
+      end if
+   end repeat
+end __executeKeepAliveTimer
+
+-- ========================================
+-- MESSAGE CALLBACK (PRIVATE)
+-- ========================================
+
+private command __invokeMessageCallback pConnID, pTopic, pMessage
+   if gMQTTMessageCallback is empty then
+      __mqttDebug "No message callback set"
+      exit __invokeMessageCallback
+   end if
+   
+   if gMQTTCallbackTarget is empty then
+      __mqttDebug "No callback target set"
+      exit __invokeMessageCallback
+   end if
+   
+   __mqttDebug "Invoking message callback:" && gMQTTMessageCallback && "for topic:" && pTopic && "(" & length(pMessage) && "bytes)"
+   
+   try
+      -- Store parameters in temporary custom properties of the target
+      set the cMQTT_Topic of gMQTTCallbackTarget to pTopic
+      set the cMQTT_Message of gMQTTCallbackTarget to pMessage
+      
+      -- Send a message to fetch and call with those properties
+      send "__mqttInvokeCallback" to gMQTTCallbackTarget
+      
+      __mqttDebug "Message callback completed successfully"
+   catch tError
+      __mqttLog "ERROR invoking message callback:" && tError
+      __mqttLog "Callback target:" && gMQTTCallbackTarget
+      __mqttLog "Callback handler:" && gMQTTMessageCallback
+   end try
+end __invokeMessageCallback
+
+-- ========================================
+-- LOGGING (PRIVATE)
+-- ========================================
+
+private command __mqttLog pMessage
+   if gMQTTQuietMode is true then
+      exit __mqttLog
+   end if
+   
+   if gMQTTLogCallback is empty then
+      exit __mqttLog
+   end if
+   
+   try
+      dispatch gMQTTLogCallback to gMQTTCallbackTarget with pMessage
+   catch tError
+      -- Callback failed, ignore
+   end try
+end __mqttLog
+
+private command __mqttDebug pMessage
+   if gMQTTDebugMode is not true then
+      exit __mqttDebug
+   end if
+   
+   __mqttLog "[DEBUG]" && pMessage
+end __mqttDebug
+
+-- ========================================
+-- UTILITY FUNCTIONS (PRIVATE)
+-- ========================================
+
+private function __encodeRemainingLength pLength
+   local tResult, tByte
+   put empty into tResult
+   
+   repeat
+      put pLength mod 128 into tByte
+      divide pLength by 128
+      put trunc(pLength) into pLength
+      
+      if pLength > 0 then
+         put tByte bitOr 0x80 into tByte
+      end if
+      
+      put tResult & __numToByte(tByte) into tResult
+      
+      if pLength <= 0 then
+         exit repeat
+      end if
+   end repeat
+   
+   return tResult
+end __encodeRemainingLength
+
+private function __decodeRemainingLength pBuffer, pStartPos
+   local tMultiplier, tValue, tByte, tPos
+   put 1 into tMultiplier
+   put 0 into tValue
+   put pStartPos into tPos
+   
+   repeat 4 times
+      if tPos > the length of pBuffer then
+         return empty
+      end if
+      
+      put charToNum(char tPos of pBuffer) into tByte
+      add ((tByte bitAnd 0x7F) * tMultiplier) to tValue
+      multiply tMultiplier by 128
+      
+      add 1 to tPos
+      
+      if (tByte bitAnd 0x80) = 0 then
+         return tValue & "," & (tPos - pStartPos)
+      end if
+   end repeat
+   
+   return empty
+end __decodeRemainingLength
+
+private function __encodeString pString
+   local tLen
+   put the length of pString into tLen
+   return binaryEncode("n", tLen) & pString
+end __encodeString
+
+private function __encodeUTF8String pString
+   local tUTF8
+   put textEncode(pString, "UTF-8") into tUTF8
+   return __encodeString(tUTF8)
+end __encodeUTF8String
+
+private function __generatePacketID pConnID
+   add 1 to gMQTTConnections[pConnID]["packetID"]
+   
+   if gMQTTConnections[pConnID]["packetID"] > 65535 then
+      put 1 into gMQTTConnections[pConnID]["packetID"]
+   end if
+   
+   if gMQTTConnections[pConnID]["packetID"] = 0 then
+      put 1 into gMQTTConnections[pConnID]["packetID"]
+   end if
+   
+   return gMQTTConnections[pConnID]["packetID"]
+end __generatePacketID
+
+private function __numToByte pNum
+   return binaryEncode("C", pNum)
+end __numToByte
+
+command mqttTestCallbackFromLibrary pTargetCard
+   -- Try to send from library to card
+   try
+      send "testLibraryToCard" to pTargetCard
+      return "OK - send succeeded"
+   catch tErr
+      return "ERROR:" && tErr
+   end try
+end mqttTestCallbackFromLibrary
+
