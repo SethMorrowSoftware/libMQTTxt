@@ -19,7 +19,7 @@ A pure OXT implementation of MQTT 3.1.1 protocol client with full QoS support, T
 
 ## Requirements
 
-- OXT 9.0 or higher
+- OXT or LCC 9.6.3
 - Network access to MQTT broker
 
 ## Installation
