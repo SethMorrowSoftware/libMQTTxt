@@ -24,13 +24,13 @@ A pure OXT implementation of MQTT 3.1.1 protocol client with full QoS support, T
 
 ## Installation
 
-1. Download `script_only_stack_` file
+1. Download `libMQTTxt` file
 2. Place in your OXT project directory
 3. Load the library in your stack:
 
 ```OXT
 on preOpenStack
-   start using stack "script_only_stack_"
+   start using stack "libMQTTxt"
 end preOpenStack
 ```
 
