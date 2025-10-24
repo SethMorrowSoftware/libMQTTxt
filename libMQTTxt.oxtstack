@@ -2,24 +2,6 @@ script "libMQTTxt"
 
 -- ========================================
 -- MQTT Client Library for OXT
--- Pure Library Version - MQTT 3.1.1 Compliant
--- Version 2.11.8 - Test Suite 100% Compliance
--- ========================================
--- Changes in v2.11.8:
--- 🔧 FIXED: Empty topic validation in mqttPublish
--- 🔧 FIXED: QoS 2 message statistics tracking
--- 🔧 IMPROVED: Debug logging in message callback invocation
--- 🔧 ENHANCED: Message reception validation
--- ========================================
--- Changes in v2.11.7:
--- 🔧 CRITICAL FIX: Timer send uses 'me' instead of stack reference
--- 🔧 FIXED: Direct logging in timer handlers (no private function calls)
--- 🔧 IMPROVED: More comprehensive global variable declarations
--- ========================================
--- Changes in v2.11.5:
--- 🔧 Timer handlers no longer use parameters (avoids colon parsing)
--- 🔧 Connection ID stored in connection record, retrieved via iteration
--- 🔧 Both keep-alive and reconnect timers use marker-based approach
 -- ========================================
 
 -- ========================================
