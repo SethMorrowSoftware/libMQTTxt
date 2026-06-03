@@ -1,6 +1,6 @@
 # MQTT Client Library Reference
 
-Version 2.11.8 - OXT MQTT 3.1.1 Implementation
+Version 2.11.9 - OXT MQTT 3.1.1 Implementation
 
 ## Table of Contents
 
@@ -674,7 +674,7 @@ function mqttTestLibrary()
 **Example:**
 ```OXT
 put mqttTestLibrary()
--- Returns: "MQTT Library v2.11.8 loaded successfully (Test Suite 100% Compliance)"
+-- Returns: "MQTT Library v2.11.9 loaded successfully (Test Suite 100% Compliance)"
 ```
 
 ---

@@ -24,13 +24,13 @@ A pure OXT implementation of MQTT 3.1.1 protocol client with full QoS support, T
 
 ## Installation
 
-1. Download `libMQTTxt` file
+1. Download the `libMQTTxt.oxtstack` file
 2. Place in your OXT project directory
 3. Load the library in your stack:
 
 ```OXT
 on preOpenStack
-   start using stack "libMQTTxt"
+   start using stack "libMQTTxt.oxtstack"
 end preOpenStack
 ```
 
@@ -62,8 +62,8 @@ end onMessage
 
 ## Documentation
 
-- **[Complete API Reference](MQTT_LIBRARY_REFERENCE.md)** - Full function documentation with examples
-- **[Test Suite](test_stack_card_script)** - Comprehensive test implementation
+- **[Complete API Reference](libMQTTxt_Reference.md)** - Full function documentation with examples
+- **Built-in Self-Test** - Call `mqttSelfTest()` to verify the library's internal encoders and helpers
 
 ## Usage Examples
 
@@ -317,7 +317,15 @@ MQTT 3.1.1 Specification Implementation:
 
 ## Version History
 
-### 2.11.8 (Current)
+### 2.11.9 (Current)
+- Critical fix: removed leftover debug `answer` dialogs from `mqttSetCallbackTarget`
+- Critical fix: incoming messages now dispatch directly to the configured message handler
+- TLS certificate verification (`pVerifyTLS`) and CA bundle (`pCACertPath`) are now honored
+- Robust timer-ID capture; keep-alive timers no longer accumulate across multiple connections
+- Corrected `stacksInUse` self-check and added missing local variable declarations
+- Documentation: fixed broken links and installation file names
+
+### 2.11.8
 - Fixed empty topic validation in mqttPublish
 - Fixed QoS 2 message statistics tracking
 - Improved debug logging in message callback invocation
@@ -411,8 +419,8 @@ Open source. Free to use in commercial and non-commercial projects.
 
 ## Support
 
-- Documentation: [MQTT_LIBRARY_REFERENCE.md](MQTT_LIBRARY_REFERENCE.md)
-- Test Suite: [test_stack_card_script](test_stack_card_script)
+- Documentation: [libMQTTxt_Reference.md](libMQTTxt_Reference.md)
+- Self-Test: call `mqttSelfTest()` to validate the library after loading
 - MQTT Specification: [MQTT 3.1.1](http://docs.oasis-open.org/mqtt/mqtt/v3.1.1/mqtt-v3.1.1.html)
 
 ## Acknowledgments

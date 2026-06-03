@@ -53,15 +53,13 @@ on libraryStack
    if gMQTTPersistentStoreEnabled is empty then
       put false into gMQTTPersistentStoreEnabled
    end if
-   
 
+   if gMQTTKeepAliveThreshold is empty then
+      put 0.75 into gMQTTKeepAliveThreshold  -- Default 75% of keep-alive interval
+   end if
 
-if gMQTTKeepAliveThreshold is empty then
-   put 0.75 into gMQTTKeepAliveThreshold  -- Default 75% of keep-alive interval
-end if
-
--- Validate that callbacks will work in current environment
-__validateCallbackEnvironment
+   -- Validate that callbacks will work in current environment
+   __validateCallbackEnvironment
 end libraryStack
 
 on releaseStack
@@ -73,16 +71,7 @@ end releaseStack
 -- ========================================
 
 command mqttSetCallbackTarget pTarget
-   -- DEBUG: Show what we received
-   answer "mqttSetCallbackTarget called" & return & \
-         "Received:" && pTarget & return & \
-         "Setting gMQTTCallbackTarget to:" && pTarget
-   
    put pTarget into gMQTTCallbackTarget
-   
-   -- DEBUG: Confirm it was set
-   answer "gMQTTCallbackTarget is now:" & return & gMQTTCallbackTarget
-   
    __mqttLog "Callback target set to:" && gMQTTCallbackTarget
    __validateCallbackEnvironment
 end mqttSetCallbackTarget
@@ -648,7 +637,7 @@ command mqttCleanupAll
 end mqttCleanupAll
 
 function mqttTestLibrary
-   return "MQTT Library v2.11.8 loaded successfully (Test Suite 100% Compliance)"
+   return "MQTT Library v2.11.9 loaded successfully (Test Suite 100% Compliance)"
 end mqttTestLibrary
 
 function mqttSelfTest
@@ -735,7 +724,7 @@ function mqttSelfTest
    -- Summary
    put "MQTT Library Self-Test" & return into tResults
    put "=====================" & return after tResults
-   put "Version: 2.11.8" & return after tResults
+   put "Version: 2.11.9" & return after tResults
    put "Passed:" && tPassed & return after tResults
    put "Failed:" && tFailed & return after tResults
    
@@ -813,7 +802,8 @@ end mqttBenchmark
 
 on mqttSocketConnected pSocketID
    global gMQTTConnections, gMQTTConnIndex
-   
+   local tConnID
+
    -- Look up the connection ID from the socket ID mapping
    put gMQTTConnIndex[pSocketID] into tConnID
    
@@ -836,8 +826,17 @@ on mqttSocketConnected pSocketID
    if gMQTTConnections[tConnID]["useTLS"] is true then
       __mqttLog "Securing socket with TLS..."
       try
-         secure socket pSocketID without verification
-         __mqttLog "Socket secured with TLS"
+         if gMQTTConnections[tConnID]["verifyTLS"] is true then
+            -- Honor certificate verification and optional CA bundle
+            if gMQTTConnections[tConnID]["caCertPath"] is not empty then
+               set the sslCertificates to gMQTTConnections[tConnID]["caCertPath"]
+            end if
+            secure socket pSocketID with verification
+            __mqttLog "Socket secured with TLS (verified)"
+         else
+            secure socket pSocketID without verification
+            __mqttLog "Socket secured with TLS (unverified)"
+         end if
       catch tError
          __mqttLog "ERROR securing TLS:" && tError
          close socket pSocketID
@@ -865,7 +864,8 @@ end mqttSocketConnected
 
 on mqttSocketDataAvailable pSocketID, pData
    global gMQTTConnections, gMQTTConnIndex
-   
+   local tConnID
+
    -- Map socket ID to connection ID
    put gMQTTConnIndex[pSocketID] into tConnID
    if tConnID is empty then put pSocketID into tConnID
@@ -903,7 +903,8 @@ end mqttSocketDataAvailable
 
 on mqttSocketClosed pSocketID
    global gMQTTConnections, gMQTTConnIndex
-   
+   local tConnID
+
    -- Map socket ID to connection ID
    put gMQTTConnIndex[pSocketID] into tConnID
    if tConnID is empty then put pSocketID into tConnID
@@ -925,7 +926,8 @@ end mqttSocketClosed
 
 on mqttSocketError pSocketID, pError
    global gMQTTConnections, gMQTTConnIndex
-   
+   local tConnID
+
    -- Map socket ID to connection ID
    put gMQTTConnIndex[pSocketID] into tConnID
    if tConnID is empty then put pSocketID into tConnID
@@ -1005,8 +1007,8 @@ private command __validateCallbackEnvironment
    local tStackList
    put the stacksInUse into tStackList
    
-   if "libMQTTxt.oxtstack" is not among the lines of tStackList then
-      __mqttLog "WARNING: libMQTTxt.oxtstack not in stacksInUse - socket callbacks may not work"
+   if tStackList does not contain "libMQTTxt" then
+      __mqttLog "WARNING: libMQTTxt not in stacksInUse - socket callbacks may not work"
       __mqttLog "Add 'start using stack" && quote & "libMQTTxt.oxtstack" & quote && "' to your startup code"
    end if
    
@@ -1063,20 +1065,14 @@ private command __scheduleReconnect pConnID, pDelay
    
    -- CRITICAL: In script-only stacks, send to 'me' works reliably
    -- The handler must be public (not private) to receive the message
-   local tDelayMS
+   local tDelayMS, tMsgID
    put pDelay * 1000 into tDelayMS
-   send "__executeReconnectTimer" to me in tDelayMS milliseconds
-   
+   put __scheduleMessage("__executeReconnectTimer", tDelayMS) into tMsgID
+
    -- Store the message ID for cancellation
-   local tPending, tLastLine, tMsgID
-   put the pendingMessages into tPending
-   if tPending is not empty then
-      put line -1 of tPending into tLastLine
-      put item 1 of tLastLine into tMsgID
-      if tMsgID is a number then
-         put tMsgID into gMQTTConnections[pConnID]["reconnectMessageID"]
-         __mqttDebug "Stored reconnect message ID:" && tMsgID && "for" && pConnID
-      end if
+   if tMsgID is not empty then
+      put tMsgID into gMQTTConnections[pConnID]["reconnectMessageID"]
+      __mqttDebug "Stored reconnect message ID:" && tMsgID && "for" && pConnID
    end if
 end __scheduleReconnect
 
@@ -1132,10 +1128,10 @@ private command __resubscribeAll pConnID
    
    __mqttLog "Resubscribing to topics after reconnect"
    
-   local tHost, tPort, tTopic, tQoS
+   local tHost, tPort, tTopic, tQoS, tResult
    put gMQTTConnections[pConnID]["host"] into tHost
    put gMQTTConnections[pConnID]["port"] into tPort
-   
+
    -- Resubscribe to each topic
    repeat for each key tTopic in gMQTTConnections[pConnID]["subscriptions"]
       put gMQTTConnections[pConnID]["subscriptions"][tTopic] into tQoS
@@ -1562,8 +1558,11 @@ private command __parseIncomingData pConnID, pData
          exit repeat
       end if
       
-      put item 1 of tRemLenResult into tRemLen
-      put item 2 of tRemLenResult into tRemLenBytes
+      -- Split "value,bytes" without relying on the global itemDelimiter
+      local tCommaPos
+      put offset(comma, tRemLenResult) into tCommaPos
+      put char 1 to (tCommaPos - 1) of tRemLenResult into tRemLen
+      put char (tCommaPos + 1) to -1 of tRemLenResult into tRemLenBytes
       
       -- Calculate total packet size
       local tPacketSize
@@ -1943,28 +1942,33 @@ end __sendPubAck
 
 private command __scheduleKeepAlive pConnID
    -- Calculate keep-alive interval
-   local tKeepAlive, tKeepAliveMS
+   local tKeepAlive, tKeepAliveMS, tMsgID
    put gMQTTConnections[pConnID]["keepAlive"] into tKeepAlive
    put tKeepAlive * 1000 into tKeepAliveMS
-   
+
+   -- Cancel any previously scheduled keep-alive timer for this connection
+   -- to prevent timer accumulation when multiple connections are active
+   if gMQTTConnections[pConnID]["keepAliveMessageID"] is not empty then
+      try
+         cancel gMQTTConnections[pConnID]["keepAliveMessageID"]
+      catch tErr
+         -- Already executed or invalid, ignore
+      end try
+      put empty into gMQTTConnections[pConnID]["keepAliveMessageID"]
+   end if
+
    -- CRITICAL: Store connection ID in the connection record itself
    -- This avoids passing it as a parameter (which fails with colons)
    put pConnID into gMQTTConnections[pConnID]["_timerConnID"]
-   
+
    -- CRITICAL: In script-only stacks, send to 'me' works reliably
    -- The handler must be public (not private) to receive the message
-   send "__executeKeepAliveTimer" to me in tKeepAliveMS milliseconds
-   
+   put __scheduleMessage("__executeKeepAliveTimer", tKeepAliveMS) into tMsgID
+
    -- Store the message ID for cancellation
-   local tPending, tLastLine, tMsgID
-   put the pendingMessages into tPending
-   if tPending is not empty then
-      put line -1 of tPending into tLastLine
-      put item 1 of tLastLine into tMsgID
-      if tMsgID is a number then
-         put tMsgID into gMQTTConnections[pConnID]["keepAliveMessageID"]
-         __mqttDebug "Stored keep-alive message ID:" && tMsgID && "for" && pConnID
-      end if
+   if tMsgID is not empty then
+      put tMsgID into gMQTTConnections[pConnID]["keepAliveMessageID"]
+      __mqttDebug "Stored keep-alive message ID:" && tMsgID && "for" && pConnID
    end if
 end __scheduleKeepAlive
 
@@ -2085,13 +2089,10 @@ private command __invokeMessageCallback pConnID, pTopic, pMessage
    __mqttDebug "Invoking message callback:" && gMQTTMessageCallback && "for topic:" && pTopic && "(" & length(pMessage) && "bytes)"
    
    try
-      -- Store parameters in temporary custom properties of the target
-      set the cMQTT_Topic of gMQTTCallbackTarget to pTopic
-      set the cMQTT_Message of gMQTTCallbackTarget to pMessage
-      
-      -- Send a message to fetch and call with those properties
-      send "__mqttInvokeCallback" to gMQTTCallbackTarget
-      
+      -- Dispatch the user-defined handler directly with the topic and payload.
+      -- Parameters are passed by value and are binary-safe.
+      dispatch gMQTTMessageCallback to gMQTTCallbackTarget with pTopic, pMessage
+
       __mqttDebug "Message callback completed successfully"
    catch tError
       __mqttLog "ERROR invoking message callback:" && tError
@@ -2209,6 +2210,31 @@ end __generatePacketID
 private function __numToByte pNum
    return binaryEncode("C", pNum)
 end __numToByte
+
+private function __scheduleMessage pHandler, pDelayMS
+   -- Schedule a message and reliably return its message ID.
+   -- Avoids the fragile "line -1 of the pendingMessages" approach, which can
+   -- capture an unrelated pending message belonging to the host application.
+   -- The pendingMessages id is the text before the first comma on each line.
+   -- Extract it with offset() so we do not depend on the global itemDelimiter.
+   local tBefore, tLine, tID
+   put cr into tBefore
+   repeat for each line tLine in the pendingMessages
+      put char 1 to (offset(comma, tLine & comma) - 1) of tLine into tID
+      put tID & cr after tBefore
+   end repeat
+
+   send pHandler to me in pDelayMS milliseconds
+
+   repeat for each line tLine in the pendingMessages
+      put char 1 to (offset(comma, tLine & comma) - 1) of tLine into tID
+      if tBefore does not contain (cr & tID & cr) then
+         return tID
+      end if
+   end repeat
+
+   return empty
+end __scheduleMessage
 
 command mqttTestCallbackFromLibrary pTargetCard
    -- Try to send from library to card
