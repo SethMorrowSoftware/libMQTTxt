@@ -58,6 +58,7 @@ local sCtCount           -- topic -> how many times it arrived (QoS 2 dedup)
 local sCtUtf8, sCtBin, sCtBig
 local sCtHoldEnd, sCtKey2
 local sCtPhase           -- sub-state within a multi-step stage
+local sCtBigStep, sCtBigOk   -- the large-payload ladder's position and high-water mark
 
 on mouseUp
    if sCtRunning is "true" then
@@ -92,6 +93,8 @@ command ctBegin
    put 0 into sCtTicks
    put false into sCtEntered
    put 0 into sCtPhase
+   put 1 into sCtBigStep
+   put 0 into sCtBigOk
    put empty into sCtKey2
 
    -- Unique per run, so a retained message left by an earlier run cannot be
@@ -113,19 +116,6 @@ command ctBegin
    put empty into sCtBin
    repeat with tI = 0 to 255
       put numToByte(tI) after sCtBin
-   end repeat
-
-   --   big: ~200 KB. Large enough that its Remaining Length needs three varint
-   --        bytes and that it cannot arrive in one socket read - which is what
-   --        the streaming-read change is for.
-   local tChunk
-   put empty into tChunk
-   repeat 64 times
-      put "0123456789abcdef" after tChunk
-   end repeat
-   put empty into sCtBig
-   repeat 200 times
-      put tChunk after sCtBig
    end repeat
 
    -- Take over the message callback for the duration. The TARGET is this
@@ -375,18 +365,44 @@ command ctStageBinary
    ctDeadline "binary payload: nothing came back", kCtDeadline
 end ctStageBinary
 
--- THE STREAMING-READ PROOF. 200 KB cannot arrive in one socket read, and its
--- Remaining Length needs three varint bytes. Under the old per-byte read this
--- was 200,000 trips through the engine's message queue.
+-- THE STREAMING-READ PROOF, AS A LADDER RATHER THAN ONE SHOT.
+--
+-- The first version published 200 KB once and reported TIMEOUT, which says the
+-- payload did not come back and nothing about WHERE the limit is. A ladder
+-- answers that: it reports the largest size that completed a round trip, so a
+-- failure names a threshold instead of a symptom.
+--
+-- It also stops at the first size that fails. Past that point the broker may be
+-- holding a partial packet, and every later result would be a consequence of
+-- this one rather than a measurement of its own.
 command ctStageBig
-   local tTopic, tRc, tGot
-   put sCtBase & "/big" into tTopic
+   local tTopic, tRc, tGot, tSize, tPayload, tChunk, tI
+
+   put ctBigSize(sCtBigStep) into tSize
+   if tSize is 0 then
+      ctPass "large payloads round-trip up to " & sCtBigOk & " bytes"
+      ctNext
+      exit ctStageBig
+   end if
+
+   put sCtBase & "/big" & tSize into tTopic
 
    if not sCtEntered then
+      put empty into tChunk
+      repeat 64 times
+         put "0123456789abcdef" after tChunk
+      end repeat
+      put empty into tPayload
+      repeat (tSize div 1024) times
+         put tChunk after tPayload
+      end repeat
+      put tPayload into sCtBig
+
       put mqttPublish(sCtHost, sCtPort, tTopic, sCtBig, 1, false) into tRc
       if tRc is not "OK" then
-         -- A broker may cap message size; that is its policy, not a defect here.
-         ctSkip "large payload", tRc
+         -- A refusal is an ANSWER, not a timeout: the library or the broker
+         -- said no, and said why.
+         ctFail "large payload at " & tSize & " bytes", tRc
          ctNext
          exit ctStageBig
       end if
@@ -396,19 +412,49 @@ command ctStageBig
 
    put sCtSeen[tTopic] into tGot
    if tGot is not empty then
-      if (the number of bytes of tGot) is (the number of bytes of sCtBig) \
-            and tGot is sCtBig then
-         ctPass "a " & (the number of bytes of sCtBig) & "-byte payload " \
-               & "reassembles exactly across many socket reads"
+      if (the number of bytes of tGot) is tSize and tGot is sCtBig then
+         put tSize into sCtBigOk
+         add 1 to sCtBigStep
+         put 0 into sCtTicks
+         put false into sCtEntered
+         ctSay "      " & tSize & " bytes round-tripped intact"
       else
-         ctFail "large payload", "sent " & the number of bytes of sCtBig \
-               & " bytes, got back " & the number of bytes of tGot
+         ctFail "large payload at " & tSize & " bytes", "got back " \
+               & the number of bytes of tGot & " bytes"
+         ctNext
       end if
-      ctNext
       exit ctStageBig
    end if
-   ctDeadline "large payload: nothing came back", kCtDeadlineBig
+
+   if sCtTicks >= kCtDeadlineBig then
+      if sCtBigOk > 0 then
+         ctFail "large payload", tSize & " bytes never came back, though " \
+               & sCtBigOk & " bytes did - the ceiling is between them"
+      else
+         ctFail "large payload", tSize & " bytes never came back"
+      end if
+      ctNext
+   end if
 end ctStageBig
+
+-- The ladder. Doubling from 4 KB: 64 KB is the first size past a typical
+-- socket buffer, and 128 KB is the first whose Remaining Length needs three
+-- varint bytes.
+function ctBigSize pStep
+   switch pStep
+      case 1
+         return 4096
+      case 2
+         return 16384
+      case 3
+         return 65536
+      case 4
+         return 131072
+      case 5
+         return 204800
+   end switch
+   return 0
+end ctBigSize
 
 -- Retained: publish with the flag, then resubscribe and expect the broker to
 -- replay it to the new subscription. Cleared before the run ends.
@@ -565,12 +611,26 @@ command ctStageHold
       exit ctStageHold
    end if
 
-   if mqttIsConnected(sCtHost, sCtPort) then
-      ctPass "the connection survived " & kCtHoldSecs & "s idle - PINGREQ/" \
-            & "PINGRESP kept it open and the keep-alive timer rescheduled"
-   else
+   -- STILL CONNECTED IS NOT ENOUGH, and the first version of this stage claimed
+   -- it was. The library pings at 45s idle and only gives up 90s after the
+   -- PINGREQ - so across a 100s hold a connection whose PINGRESP never came
+   -- back is still marked connected, and the assertion passed on a link that
+   -- was dead in one direction. lastPingTime is the observable that separates
+   -- them: __parsePingResp zeroes it, so a value still standing means a ping
+   -- went out and nothing came back.
+   local tInfo
+   put mqttGetConnectionInfo(sCtHost, sCtPort) into tInfo
+
+   if not mqttIsConnected(sCtHost, sCtPort) then
       ctFail "keep-alive", "the connection dropped during the idle hold, which " \
             & "is what a keep-alive that never fired looks like"
+   else if tInfo["lastPingTime"] is not 0 then
+      ctFail "keep-alive", "a PINGREQ went out and no PINGRESP came back " \
+            & "(lastPingTime still " & tInfo["lastPingTime"] & ") - the link " \
+            & "is dead inbound and only looks connected"
+   else
+      ctPass "the connection survived " & kCtHoldSecs & "s idle AND a PINGRESP " \
+            & "was received and processed - keep-alive and its timer both work"
    end if
 
    if sCtKey2 is not empty then
@@ -612,6 +672,18 @@ end ctPass
 command ctFail pWhat, pWhy
    add 1 to sCtFail
    ctSay "FAIL  " & pWhat & " - " & pWhy
+
+   -- A BROKEN RECEIVE PATH POISONS EVERY STAGE AFTER IT, and the run that
+   -- found this printed two PASSes it had not earned: after a large PUBLISH
+   -- left the broker mid-packet, nothing inbound was processed again - so
+   -- "nothing is delivered after unsubscribing" passed because nothing was
+   -- being delivered at all. A report whose later lines cannot be trusted has
+   -- to say so, or its green outnumbers its red and reads as a pass.
+   if sCtFail is 1 then
+      ctSay "      NOTE: the first failure is above. Inbound packets may have " \
+            & "stopped there, so every result below it - including any PASS - " \
+            & "needs the earlier failure fixed before it means anything."
+   end if
 end ctFail
 
 command ctSkip pWhat, pWhy

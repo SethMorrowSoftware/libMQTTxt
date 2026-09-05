@@ -95,6 +95,7 @@ end onMessage
 - **[Complete API Reference](libMQTTxt_Reference.md)** - Full function documentation with examples
 - **[The demo](examples/mqtt-dashboard.livecodescript)** - one paste-and-run file; the shortest path to seeing the library work
 - **Built-in Self-Test** - Call `mqttSelfTest()` to verify the library's internal encoders and helpers
+- **[docs/ENGINE-NOTES.md](docs/ENGINE-NOTES.md)** - what OXT and real brokers actually do, and what each fact cost to learn
 - **[tools/VENDORED.md](tools/VENDORED.md)** - what this repo carries from [xtalk-suite](https://github.com/SethMorrowSoftware/xtalk-suite), and how to re-sync it
 
 ## Usage Examples
@@ -371,12 +372,32 @@ many. The demo's Self-test button runs it and logs the result.
 Anything involving a live broker — QoS flows, TLS, reconnect, wildcards, large
 payloads — needs a real engine and a real broker.
 
-**Honesty note:** everything in 2.12.0 is *verified statically; needs an OXT
-pass.* The gates and protocol vectors above are green, but no line of 2.12.0 —
-library or demo — has been observed on a running engine against a live broker.
-That includes the demo's window: no gate here can prove a stack BUILDS, only
-that its geometry is sound and its script is well-formed. The performance
-figures below are from 2.11.x and have not been re-measured.
+### What a real run has established
+
+**First engine pass: 2026-09-05**, on OXT against a local mosquitto and
+`broker.hivemq.com`. Recorded in [docs/ENGINE-NOTES.md](docs/ENGINE-NOTES.md).
+
+Now **observed** rather than argued: the library and demo compile and load; the
+demo builds its window; CONNECT is accepted by two independent brokers; the
+streaming read works; QoS 0/1/2 round trips complete with their acknowledgment
+legs drained and QoS 2 delivered exactly once; **a 13-byte, 7-character UTF-8
+payload round-trips byte for byte** — the exact case a character-counted
+Remaining Length gets wrong; and all 256 byte values survive intact.
+
+That same run found two things the gates could not:
+
+- **A failed socket write does not throw** — LiveCode reports it in `the
+  result`, so all twelve of this library's writes reported success on writes
+  that may not have happened. A large PUBLISH left the broker holding a partial
+  packet and the connection went silent inbound with no error on either side.
+  Fixed in 2.12.1; a gate now refuses a bare `write ... to socket`.
+- **`secure socket ... with verification` reported success on a plaintext
+  port.** Treat TLS status as unverified regardless of what the log says, and
+  confirm a TLS connection reached CONNACK before trusting it. Not yet closed.
+
+**Still unproven:** keep-alive end to end, auto-reconnect after a broker
+restart, multi-connection, persistent store, and TLS. The performance figures
+below are from 2.11.x and have not been re-measured.
 
 ## Performance
 
@@ -447,7 +468,35 @@ MQTT 3.1.1 Specification Implementation:
 
 ## Version History
 
-### 2.12.0 (Current)
+### 2.12.1 (Current)
+
+Everything here came from the first run on a real engine (2026-09-05), and
+neither item was reachable by any static gate.
+
+- **A failed socket write does not throw.** LiveCode reports it in `the result`,
+  so `try / write ... to socket / catch` catches nothing and the caller is told
+  a write succeeded that may not have. A 204800-byte PUBLISH left the broker
+  holding a fixed header promising bytes that never arrived; it then read
+  everything sent afterwards as that packet's tail, so it stopped acknowledging,
+  stopped echoing and answered no PINGREQ — while the client saw clean writes
+  and a socket the engine still called open. All twelve writes now route through
+  `__writeSocket`, which checks both; a failed PUBLISH also drops its pendingAcks
+  entry, so a message the caller was told had failed is not retransmitted as a
+  DUP on the next reconnect.
+- **The conformance run's keep-alive assertion was too weak** and passed on a
+  link that was dead inbound. It now requires `lastPingTime` to be 0 — the value
+  `__parsePingResp` zeroes — so an unanswered ping fails.
+- **A failing run now says its later results are suspect.** After a broken
+  receive path, "nothing is delivered after unsubscribing" passed because
+  nothing was being delivered at all.
+- The large-payload stage is a **size ladder** (4 KB → 200 KB) reporting the
+  largest size that round-trips, so a failure names a threshold rather than a
+  symptom.
+- `docs/ENGINE-NOTES.md` records both engine facts under the suite's evidence
+  rule, including `secure socket ... with verification` reporting success on a
+  plaintext port.
+
+### 2.12.0
 
 A correctness and robustness pass. Three of these are behaviour changes that
 existing code can notice; they are listed first and deliberately.

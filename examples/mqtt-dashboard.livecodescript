@@ -526,11 +526,10 @@ command mqttDisconnect pHost, pPort
       put __numToByte(0xE0) & __numToByte(0) into tPacket
 
       if __isSocketOpen(tConnID) then
-         try
-            write tPacket to socket tConnID
-         catch tErr
+         put __writeSocket(tConnID, tPacket) into tErr
+         if tErr is not empty then
             __mqttDebug "Error writing DISCONNECT packet:" && tErr
-         end try
+         end if
       end if
    end if
 
@@ -625,24 +624,29 @@ function mqttPublish pHost, pPort, pTopic, pMessage, pQoS, pRetain
 
    -- Send the packet
    local tError
-   try
-      write tPacket to socket tConnID
-      put the milliseconds into gMQTTConnections[tConnID]["lastActivity"]
-
-      -- Update statistics
-      add 1 to gMQTTConnections[tConnID]["stats"]["messagesSent"]
-      add the number of bytes of tPacket to gMQTTConnections[tConnID]["stats"]["bytesSent"]
-
-      -- Save to persistent store if QoS > 0
-      if (pQoS > 0) and gMQTTPersistentStoreEnabled then
-         __savePersistentMessages tConnID
+   put __writeSocket(tConnID, tPacket) into tError
+   if tError is not empty then
+      -- The message never left. Drop the acknowledgment record with it: a
+      -- pendingAcks entry for a PUBLISH that was not sent would be
+      -- retransmitted as a DUP on the next reconnect, delivering a message the
+      -- caller was already told had failed.
+      if tPacketID is not empty and tPacketID > 0 then
+         delete variable gMQTTConnections[tConnID]["pendingAcks"][tPacketID]
       end if
-
-      __mqttLog "Published:" && pTopic && "(" & tPayloadBytes && "bytes, QoS" && pQoS & ")"
-      return "OK"
-   catch tError
       return "ERROR:" && tError
-   end try
+   end if
+
+   put the milliseconds into gMQTTConnections[tConnID]["lastActivity"]
+
+   add 1 to gMQTTConnections[tConnID]["stats"]["messagesSent"]
+   add the number of bytes of tPacket to gMQTTConnections[tConnID]["stats"]["bytesSent"]
+
+   if (pQoS > 0) and gMQTTPersistentStoreEnabled then
+      __savePersistentMessages tConnID
+   end if
+
+   __mqttLog "Published:" && pTopic && "(" & tPayloadBytes && "bytes, QoS" && pQoS & ")"
+   return "OK"
 end mqttPublish
 
 -- ========================================
@@ -698,18 +702,18 @@ function mqttSubscribe pHost, pPort, pTopic, pQoS
 
    -- Send the packet
    local tError
-   try
-      write tPacket to socket tConnID
-      put the milliseconds into gMQTTConnections[tConnID]["lastActivity"]
-      __mqttLog "Subscribed to:" && pTopic && "(QoS" && pQoS & ")"
-
-      -- Store subscription for reconnection
-      put pQoS into gMQTTConnections[tConnID]["subscriptions"][pTopic]
-
-      return "OK"
-   catch tError
+   put __writeSocket(tConnID, tPacket) into tError
+   if tError is not empty then
       return "ERROR:" && tError
-   end try
+   end if
+
+   put the milliseconds into gMQTTConnections[tConnID]["lastActivity"]
+   __mqttLog "Subscribed to:" && pTopic && "(QoS" && pQoS & ")"
+
+   -- Store subscription for reconnection
+   put pQoS into gMQTTConnections[tConnID]["subscriptions"][pTopic]
+
+   return "OK"
 end mqttSubscribe
 
 function mqttUnsubscribe pHost, pPort, pTopic
@@ -747,18 +751,18 @@ function mqttUnsubscribe pHost, pPort, pTopic
 
    -- Send the packet
    local tError
-   try
-      write tPacket to socket tConnID
-      put the milliseconds into gMQTTConnections[tConnID]["lastActivity"]
-      __mqttLog "Unsubscribed from:" && pTopic
-      
-      -- Remove from subscription list
-      delete variable gMQTTConnections[tConnID]["subscriptions"][pTopic]
-      
-      return "OK"
-   catch tError
+   put __writeSocket(tConnID, tPacket) into tError
+   if tError is not empty then
       return "ERROR:" && tError
-   end try
+   end if
+
+   put the milliseconds into gMQTTConnections[tConnID]["lastActivity"]
+   __mqttLog "Unsubscribed from:" && pTopic
+
+   -- Remove from subscription list
+   delete variable gMQTTConnections[tConnID]["subscriptions"][pTopic]
+
+   return "OK"
 end mqttUnsubscribe
 
 -- ========================================
@@ -846,15 +850,13 @@ command mqttCleanupAll
          end if
 
          -- Send DISCONNECT and close socket
-         try
-            if __isSocketOpen(tConnID) then
-               put __numToByte(0xE0) & __numToByte(0) into tPacket
-               write tPacket to socket tConnID
-               close socket tConnID
-            end if
-         catch tErr
-            -- Socket already closed
-         end try
+         if __isSocketOpen(tConnID) then
+            put __numToByte(0xE0) & __numToByte(0) into tPacket
+            -- A failed DISCONNECT is not worth reporting on a teardown path,
+            -- but it must not skip the close that follows it.
+            put __writeSocket(tConnID, tPacket) into tErr
+            __closeSocketQuietly tConnID
+         end if
       end repeat
 
       __mqttLog "All connections cleaned up"
@@ -870,7 +872,7 @@ command mqttCleanupAll
 end mqttCleanupAll
 
 function mqttTestLibrary
-   return "MQTT Library v2.12.0 loaded successfully"
+   return "MQTT Library v2.12.1 loaded successfully"
 end mqttTestLibrary
 
 function mqttSelfTest
@@ -1003,7 +1005,7 @@ function mqttSelfTest
    -- Summary
    put "MQTT Library Self-Test" & return into tResults
    put "=====================" & return after tResults
-   put "Version: 2.12.0" & return after tResults
+   put "Version: 2.12.1" & return after tResults
    put "Passed:" && tPassed & return after tResults
    put "Failed:" && tFailed & return after tResults
 
@@ -1188,10 +1190,10 @@ on mqttSocketConnected pSocketID
       exit mqttSocketConnected
    end if
 
-   try
-      write tPacket to socket pSocketID
+   put __writeSocket(pSocketID, tPacket) into tError
+   if tError is empty then
       __mqttLog "CONNECT packet sent"
-   catch tError
+   else
       -- Without a CONNECT the broker will never answer, so there is nothing to
       -- read; the old code logged this and armed the read anyway, producing a
       -- connection that sat silent until the user gave up on it.
@@ -1199,7 +1201,7 @@ on mqttSocketConnected pSocketID
       __cleanupConnection tConnID, "CONNECT write failed:" && tError
       __handleReconnect tConnID
       exit mqttSocketConnected
-   end try
+   end if
 
    -- Start reading from socket
    local tArmError
@@ -1430,6 +1432,37 @@ private command __cleanupConnection pConnID, pReason
    -- call straight back into this library, and it should see a settled record.
    __invokeStateChangeCallback "disconnected", tHost, tPort, pReason
 end __cleanupConnection
+
+-- Write a packet, and REPORT whether it actually went out.
+-- Returns empty on success, or the error text.
+--
+-- WHY THIS EXISTS, and it is the same lesson the persistent store already
+-- carries one level up: a failed socket write does not always throw. LiveCode
+-- sets `the result`, so a `try`/`catch` around `write ... to socket` catches
+-- nothing and the caller reports success on a write that did not happen. Every
+-- one of this library's twelve socket writes was shaped that way.
+--
+-- IT MATTERS MOST FOR A BIG PACKET, which is where it was found: a PUBLISH
+-- whose bytes are only partly written leaves the broker holding a fixed header
+-- that promises N bytes and a stream that never delivers them. The broker then
+-- reads everything the client sends afterwards as the missing tail of that one
+-- packet - so it stops acknowledging, stops echoing, and answers no PINGREQ,
+-- while the client sees clean writes and a socket the engine still calls open.
+-- The connection is dead in one direction and nothing on either side says so.
+private function __writeSocket pSocketID, pPacket
+   local tError, tRes
+   try
+      write pPacket to socket pSocketID
+   catch tError
+      return tError
+   end try
+
+   put the result into tRes
+   if tRes is not empty then
+      return tRes
+   end if
+   return empty
+end __writeSocket
 
 private command __closeSocketQuietly pSocketID
    -- Closing an already-closed socket is not an error worth propagating, but it
@@ -2301,12 +2334,12 @@ private command __resendPendingAcks pConnID
       put tFixedHeader & tRemLenBytes & tVarHeader & tPayload into tPacket
 
       if __isSocketOpen(pConnID) then
-         try
-            write tPacket to socket pConnID
+         put __writeSocket(pConnID, tPacket) into tError
+         if tError is empty then
             __mqttDebug "Resent (DUP) packet" && tPacketID
-         catch tError
+         else
             __mqttLog "ERROR resending packet" && tPacketID & ":" && tError
-         end try
+         end if
       end if
    end repeat
 end __resendPendingAcks
@@ -2852,12 +2885,12 @@ private command __sendPubRec pConnID, pPacketID
    put __buildPubRecPacket(pPacketID) into tPacket
    
    if __isSocketOpen(pConnID) then
-      try
-         write tPacket to socket pConnID
+      put __writeSocket(pConnID, tPacket) into tError
+      if tError is empty then
          __mqttDebug "PUBREC sent for packet" && pPacketID
-      catch tError
+      else
          __mqttLog "ERROR sending PUBREC:" && tError
-      end try
+      end if
    end if
 end __sendPubRec
 
@@ -2871,12 +2904,12 @@ private command __sendPubRel pConnID, pPacketID
    put __buildPubRelPacket(pPacketID) into tPacket
    
    if __isSocketOpen(pConnID) then
-      try
-         write tPacket to socket pConnID
+      put __writeSocket(pConnID, tPacket) into tError
+      if tError is empty then
          __mqttDebug "PUBREL sent for packet" && pPacketID
-      catch tError
+      else
          __mqttLog "ERROR sending PUBREL:" && tError
-      end try
+      end if
    end if
 end __sendPubRel
 
@@ -2890,12 +2923,12 @@ private command __sendPubComp pConnID, pPacketID
    put __buildPubCompPacket(pPacketID) into tPacket
    
    if __isSocketOpen(pConnID) then
-      try
-         write tPacket to socket pConnID
+      put __writeSocket(pConnID, tPacket) into tError
+      if tError is empty then
          __mqttDebug "PUBCOMP sent for packet" && pPacketID
-      catch tError
+      else
          __mqttLog "ERROR sending PUBCOMP:" && tError
-      end try
+      end if
    end if
 end __sendPubComp
 
@@ -2909,12 +2942,12 @@ private command __sendPubAck pConnID, pPacketID
    put __numToByte(0x40) & __numToByte(2) & binaryEncode("n", pPacketID) into tPacket
    
    if __isSocketOpen(pConnID) then
-      try
-         write tPacket to socket pConnID
+      put __writeSocket(pConnID, tPacket) into tError
+      if tError is empty then
          __mqttDebug "PUBACK sent for packet" && pPacketID
-      catch tError
+      else
          __mqttLog "ERROR sending PUBACK:" && tError
-      end try
+      end if
    end if
 end __sendPubAck
 
@@ -3019,20 +3052,20 @@ on __executeKeepAliveTimer pToken
       put __buildPingReqPacket() into tPingPacket
 
       if __isSocketOpen(tConnID) then
-         try
-            write tPingPacket to socket tConnID
+         put __writeSocket(tConnID, tPingPacket) into tError
+         if tError is empty then
             put the milliseconds into gMQTTConnections[tConnID]["lastActivity"]
             put the milliseconds into gMQTTConnections[tConnID]["lastPingTime"]
             __mqttDebug "PINGREQ sent (threshold:" && (__keepAliveThreshold() * 100) & "%)"
-         catch tError
+         else
             -- A failed write on a socket the engine still calls open means the
             -- link is gone; treat it as the disconnection it is instead of
-            -- logging and waiting for a keep-alive that can never be answered.
+            -- waiting for a keep-alive that can never be answered.
             __mqttLog "ERROR sending ping:" && tError
             __cleanupConnection tConnID, "ping write failed:" && tError
             __handleReconnect tConnID
             exit __executeKeepAliveTimer
-         end try
+         end if
       else
          __mqttLog "Keep-alive found socket closed for" && tConnID
          __cleanupConnection tConnID, "socket not open"

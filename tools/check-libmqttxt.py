@@ -318,6 +318,43 @@ def check_catch_variables_declared(lines, problems):
         flush()
 
 
+def check_socket_writes_are_checked(lines, problems):
+    """Every socket write goes through __writeSocket.
+
+    A failed socket write does not always throw - LiveCode sets `the result` -
+    so a bare `write ... to socket` inside a try/catch reports success on a
+    write that did not happen. All twelve of this library's writes were shaped
+    that way, and it was found on a real broker: a 200 KB PUBLISH left the
+    broker holding a fixed header promising bytes that never arrived, after
+    which it read everything sent afterwards as that packet's missing tail. It
+    stopped acknowledging, stopped echoing and answered no PINGREQ, while the
+    client saw clean writes and a socket the engine still called open.
+
+    The same lesson the persistent store already carries for file I/O, one
+    layer down. __writeSocket checks both the throw and `the result`.
+    """
+    current = None
+    for n, raw in enumerate(lines, 1):
+        stripped = strip_noise(raw)
+        m = HANDLER_RE.match(stripped)
+        if m:
+            current = m.group(3)
+            continue
+        if handler_end(stripped):
+            current = None
+            continue
+        # The one legitimate bare write: the helper everything else routes
+        # through. Exempted by NAME, so the exemption cannot quietly widen.
+        if current == "__writeSocket":
+            continue
+        if re.search(r"^\s*write\b.*\bto\s+socket\b", stripped):
+            problems.append(
+                "%d: a bare `write ... to socket`. A failed write sets `the "
+                "result` rather than throwing, so this reports success on a "
+                "write that did not happen - route it through __writeSocket."
+                % n)
+
+
 def check_no_control_references(lines, problems):
     """The library is HEADLESS: it names no field, button, graphic or image.
 
@@ -385,6 +422,7 @@ def main():
     check_timer_handlers_take_a_token(defined, problems)
     check_per_byte_reads(lines, problems)
     check_no_control_references(lines, problems)
+    check_socket_writes_are_checked(lines, problems)
 
     if problems:
         for p in problems:
