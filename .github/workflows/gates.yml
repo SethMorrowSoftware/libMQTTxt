@@ -1,15 +1,18 @@
-# The compiler-free gates for libMQTTxt.
+# The compiler-free gates for libMQTTxt and its demo.
 #
 # WHY THIS FILE EXISTS: OXT has no headless way to compile or run a
-# `.oxtstack`, so nothing in CI can prove that this library LOADS. What CI can
-# prove is everything that is pure computation or pure structure, and that is
-# what runs here - each rule standing in for a compiler that cannot be run.
+# `.oxtstack` / `.livecodescript`, so nothing in CI can prove that this library
+# LOADS or that the demo BUILDS ITS WINDOW. What CI can prove is everything
+# that is pure computation or pure structure, and that is what runs here - each
+# rule standing in for a compiler that cannot be run.
 #
-# Note the ORDER inside the job, which is the whole point of the middle step: a
-# gate that has gone blind reports OK, and OK is exactly what a blind gate and a
-# clean tree look like from the outside. test-check-libmqttxt.py reintroduces
-# each defect into a real copy of the library and fails if the gate stays quiet,
-# so it runs BEFORE the gate whose output it makes meaningful.
+# Note the ORDER, which is the whole point of the first two steps: a gate that
+# has gone blind reports OK, and OK is exactly what a blind gate and a clean
+# tree look like from the outside. The mutation tests reintroduce each defect
+# into a real copy of the tree and fail if the gate stays quiet, so they run
+# BEFORE the gates whose output they make meaningful.
+#
+# tools/run-gates.sh runs this same set locally, in this same order.
 name: gates
 
 on:
@@ -36,16 +39,40 @@ jobs:
         with:
           python-version: "3.11"
 
-      # The discriminating test first: it is what makes the gate's OK mean
-      # something. If a rule has stopped firing, fail here rather than sail
-      # through a green gate that is no longer looking.
-      - name: gate still discriminates
+      # --- the gates that make the other gates mean something ---------------
+      - name: gate discrimination (library)
         run: python3 tools/test-check-libmqttxt.py
 
-      - name: static gate
+      - name: gate discrimination (demo)
+        run: python3 tools/test-demo-gates.py
+
+      # --- the library ------------------------------------------------------
+      - name: library static gate
         run: python3 tools/check-libmqttxt.py
 
       # The framing is pure computation, so it can be proved offline against
       # MQTT 3.1.1 byte sequences rather than against this library's own output.
       - name: MQTT 3.1.1 protocol vectors
         run: python3 tools/test-mqtt-vectors.py
+
+      # --- the demo ---------------------------------------------------------
+      # The demo carries the library, the UI kit and the boot self-check. Each
+      # copy has a gate holding it identical to its master, because a demo that
+      # is one paste-and-run file is a demo whose copies can go stale.
+      - name: embedded library is current
+        run: python3 tools/sync-demo-embeds.py --check
+
+      - name: carried blocks are unchanged
+        run: python3 tools/check-carried-blocks.py
+
+      - name: control lists are derived from source
+        run: python3 tools/check-demo-control-lists.py
+
+      # Neither of these can be seen without an engine, which is why they are
+      # gates: a control past the bottom edge and an unpinned delayed write
+      # both fail silently at runtime.
+      - name: layout fits its window
+        run: python3 tools/check-demo-layout.py
+
+      - name: delayed handlers pin a stack
+        run: python3 tools/check-timer-stack-pin.py

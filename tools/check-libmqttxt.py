@@ -66,6 +66,28 @@ def strip_noise(line):
     return "".join(out)
 
 
+def strip_comment_only(line):
+    """Blank the comment, KEEP the string literals.
+
+    strip_noise blanks literals too, and a scan that needs a literal's CONTENT
+    must not use it: `field "y"` becomes `field    ` there, so a rule looking
+    for a control reference reads a clean line. This gate's own first run of
+    check_no_control_references passed its mutation test's planted bug for
+    exactly that reason - the third time in this family that literal-blanking
+    silently changed an answer.
+    """
+    out, in_str, i = [], False, 0
+    while i < len(line):
+        c = line[i]
+        if c == '"':
+            in_str = not in_str
+        elif not in_str and line[i:i + 2] == "--":
+            break
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def load(path):
     with open(path, encoding="utf-8") as fh:
         return fh.read().split("\n")
@@ -296,6 +318,38 @@ def check_catch_variables_declared(lines, problems):
         flush()
 
 
+def check_no_control_references(lines, problems):
+    """The library is HEADLESS: it names no field, button, graphic or image.
+
+    This is not a style rule, it is what makes another gate sound.
+    tools/check-timer-stack-pin.py finds delayed handlers by matching
+    `send "name" to me in` against raw text - and this library arms its timers
+    through `send pHandler to me in`, where the handler name is a VARIABLE. So
+    the library's own timer chains are invisible to that gate.
+
+    That blind spot is harmless only while there is nothing to pin: the hazard
+    it exists for is an unqualified control reference inside a delayed handler
+    (engine note 5.3). A library that touches no control cannot have one. This
+    rule holds that precondition, so the day somebody adds `put x into field
+    "y"` here, it fails HERE rather than becoming a silent gap over there.
+
+    Callbacks are how this library reaches a UI, and they go out through
+    `dispatch` to the application's own handlers - which is the only shape that
+    works for a library whose caller owns the window.
+    """
+    ref = re.compile(r"\b(field|button|graphic|image|scrollbar|player)\s+"
+                     r'("[^"]*"|[A-Za-z_]\w*)')
+    for n, raw in enumerate(lines, 1):
+        m = ref.search(strip_comment_only(raw))
+        if m:
+            problems.append(
+                "%d: names a control (`%s`). This library is headless - it "
+                "reaches a UI only through dispatch to the caller's handlers - "
+                "and check-timer-stack-pin.py cannot see its variable-named "
+                "`send`, so a control reference here would be an unpinned "
+                "delayed write no gate is watching." % (n, m.group(0).strip()))
+
+
 def check_per_byte_reads(lines, problems):
     """`read ... for 1 ...` costs one engine message dispatch per byte.
 
@@ -330,6 +384,7 @@ def main():
     check_engine_messages_pass(lines, problems)
     check_timer_handlers_take_a_token(defined, problems)
     check_per_byte_reads(lines, problems)
+    check_no_control_references(lines, problems)
 
     if problems:
         for p in problems:

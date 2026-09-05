@@ -91,6 +91,12 @@ CASES = [
                          "read from socket pSocketID for 1 with message"),
         "one message PER BYTE",
     ),
+    (
+        "a control reference in the headless library",
+        lambda s: mutate(s, '   __mqttDebug "PINGRESP received"',
+                         '   put "x" into field "y"'),
+        "This library is headless",
+    ),
 ]
 
 
