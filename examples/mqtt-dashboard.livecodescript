@@ -1,4 +1,59 @@
-script "libMQTTxt"
+script "MqttDashboard"
+
+-- mqtt-dashboard.livecodescript - libMQTTxt's demo: connect to a broker,
+-- subscribe, publish, and watch the traffic. One file, paste and open.
+--
+-- What to look at as a template:
+--   * INITIALISE THE EMBEDDED LIBRARY YOURSELF. The engine sends
+--     `libraryStack` only to a stack in stacksInUse; this demo CARRIES
+--     libMQTTxt in its own script, so that message never arrives and
+--     preOpenStack calls mqttInitialize instead. Every embedding stack owes
+--     the library that one line.
+--   * THE ENGINE'S SOCKET MESSAGES RIDE ALONG. socketError / socketClosed /
+--     socketTimeout come from the embedded library and this demo defines none
+--     of its own, so its `on socket*` wrappers must NOT be dropped - drop them
+--     with nothing else listening and the sockets go quiet with no error, which
+--     is the worst failure shape there is.
+--   * CALLBACKS BEFORE CONNECT. mqttSetCallbackTarget then the four handler
+--     names, so nothing that arrives during the handshake is dropped.
+--   * closeStack calls mqttCleanupAll - the one mandatory teardown, or the
+--     sockets and keep-alive timers outlive the window.
+--
+-- HOW TO USE:
+--   1. Paste THIS file into a stack script and reopen the stack - opening the
+--      file itself builds no window (OXT-ENGINE-NOTES 5.5). libMQTTxt is
+--      embedded already, so there is nothing else to load.
+--   2. The form is pre-filled for a public test broker. Press Connect, then
+--      Subscribe, then Publish to the topic you subscribed to and watch it
+--      come back.
+--
+-- TLS: tick TLS for port 8883. "Verify cert" is ON by default and should stay
+-- that way; an unverified TLS socket is encrypted against a passive listener
+-- and worthless against an active one.
+--
+-- HONESTY (the suite convention): this stack has NOT run on an OXT engine
+-- against a live broker. libMQTTxt 2.12.0 is verified statically - its gates
+-- and MQTT 3.1.1 protocol vectors are green offline - and this demo is the
+-- surface that pass would be run through. Verified statically; needs an OXT
+-- pass.
+--
+-- THE LOOK is the suite UI kit, carried verbatim between the marker lines
+-- (master: tools/ui-kit.livecodescript, vendored from xtalk-suite - see
+-- tools/VENDORED.md; the drift gate holds every copy byte-identical). Change
+-- the look in the master, never here.
+
+-- Bump when the generated UI changes so a saved stack rebuilds its controls.
+
+-- >>> BEGIN EMBEDDED LIBRARIES (tools/sync-demo-embeds.py) >>>
+-- Pasted from the source below so this demo runs with NO `start
+-- using` wiring. Do not edit inside these sentinels: run
+-- `python3 tools/sync-demo-embeds.py` instead. The source stays the
+-- single point of truth and the right dependency for a real project.
+--
+-- The library is placed ABOVE the demo's own code because OXT resolves
+-- script-level declarations by lexical position.
+
+-- ---- libMQTTxt.oxtstack ----
 
 -- ========================================
 -- MQTT Client Library for OXT
@@ -3212,3 +3267,1303 @@ command mqttTestCallbackFromLibrary pTargetCard
    end try
 end mqttTestCallbackFromLibrary
 
+-- <<< END EMBEDDED LIBRARIES <<<
+
+constant kMdUiVersion = "mqtt-dashboard-kit2-1"
+
+-- Defaults: a public test broker, so the form is useful before it is edited.
+constant kMdHost = "broker.hivemq.com"
+constant kMdPort = 1883
+constant kMdTopic = "libmqttxt/demo"
+
+-- The dashboard tick. 1 Hz is enough for counters; nothing here drives the
+-- protocol, which runs entirely on the library's own socket and timer paths.
+constant kMdDashMs = 1000
+
+local sConnected        -- "true" once CONNACK landed
+local sConnKey          -- "host:port" of the connection this window owns
+local sDashOn           -- "true" while the 1 Hz dashboard chain may reschedule
+local sTLS              -- "true" when the TLS checkbox is ticked
+local sVerify           -- "true" when the verify-certificate checkbox is ticked
+local sAuto             -- "true" when auto-reconnect is ticked
+local sRetain           -- "true" when the publish retain checkbox is ticked
+local sRecv             -- messages delivered to mdOnMessage this session
+
+-- ==== SUITE UI KIT v2 BEGIN (verbatim copy; master: tools/ui-kit.livecodescript; gate: tools/check-ui-kit-drift.py) ====
+-- The family look as one carried block: the kit owns colors, chrome, and
+-- control construction; the adopting demo owns layout (explicit rects) and
+-- logic. Builders are idempotent (create-if-missing), so a rebuild on
+-- reopen is safe. Do not edit this block in place: change the master and
+-- re-carry it.
+constant kUiBg = "240,242,246"
+constant kUiCard = "255,255,255"
+constant kUiCardLine = "225,229,236"
+constant kUiAccent = "44,90,160"
+constant kUiAccentText = "255,255,255"
+constant kUiAccentSub = "199,216,241"
+constant kUiInk = "28,34,46"
+constant kUiInkSoft = "95,104,118"
+constant kUiMuted = "138,146,158"
+constant kUiOk = "23,128,63"
+constant kUiWarn = "150,110,40"
+constant kUiBad = "176,58,46"
+constant kUiFieldLine = "203,210,222"
+constant kUiCodeBg = "244,246,250"
+constant kUiCodeLine = "210,217,229"
+
+-- The platform's own terminal face for codes, keys, tables and logs, so
+-- the monospace surfaces look native instead of typewriter-Courier. A
+-- missing face substitutes the engine default - a soft, safe failure.
+function uiMonoFont
+   if the platform is "MacOS" then
+      return "Menlo"
+   else if the platform is "Win32" then
+      return "Consolas"
+   end if
+   return "DejaVu Sans Mono"
+end uiMonoFont
+
+-- The window chrome every adopter shares: stack size, page ground, the
+-- title band, and the one status line under it (write it with uiStatus).
+-- pBandH is optional (default 30); a taller band leaves room for an
+-- adopter's tagline or status pill, placed by the adopter.
+command uiChrome pTitle, pWidth, pHeight, pBandH
+   local tFH
+   if pBandH is empty then
+      put 30 into pBandH
+   end if
+   set the width of this stack to pWidth
+   set the height of this stack to pHeight
+   set the backgroundColor of this card to kUiBg
+   set the title of this stack to pTitle
+   uiGfx "uiBand", "0,0," & pWidth & "," & pBandH
+   set the style of graphic "uiBand" to "rectangle"
+   set the filled of graphic "uiBand" to true
+   set the backgroundColor of graphic "uiBand" to kUiAccent
+   set the lineSize of graphic "uiBand" to 0
+   uiLabel "uiTitle", "  " & pTitle, "0,0," & pWidth & "," & pBandH, 15
+   set the foregroundColor of field "uiTitle" to kUiAccentText
+   set the textStyle of field "uiTitle" to "bold"
+   -- center the title on the band midline by MEASURED height (never guess
+   -- font metrics - the family's OXT passes clipped hand-sized labels)
+   put the formattedHeight of field "uiTitle" into tFH
+   if tFH > 0 and tFH < pBandH then
+      set the height of field "uiTitle" to tFH
+      set the top of field "uiTitle" to ((pBandH - tFH) div 2)
+   end if
+   uiLabel "uiStatus", empty, "16," & (pBandH + 4) & "," & (pWidth - 16) & "," & (pBandH + 22), 11
+end uiChrome
+
+-- The status line, colored by what it reports: "ok", "warn", "bad", or
+-- anything else for neutral/muted. Demos route probe results through this
+-- so a stack that cannot run says so in red, at the top, immediately.
+command uiStatus pText, pKind
+   -- PIN THE STACK, THEN CHECK THE FIELD EXISTS. Both halves were missing and
+   -- both are load-bearing on a TIMER-driven call.
+   --
+   -- An unqualified `field "uiStatus"` resolves against the DEFAULTSTACK, not
+   -- against the stack whose script is running. Inside openStack those are the
+   -- same thing, which is why every demo's startup status line always worked.
+   -- A handler arriving from `send ... in` has no such guarantee: with a second
+   -- stack in front, the write lands in the wrong stack or resolves to nothing.
+   --
+   -- THE PIN RESTS ON THE DOCUMENTED RESOLUTION RULE, NOT ON A THROW WE SAW.
+   -- This comment used to cite enet-lan-chat's once-a-second dashboard throwing
+   -- "Chunk: error in object expression" REPEATEDLY on 2026-08-18, and dht-chat
+   -- hiding the same fault behind a guard. Neither half held up: that throw was
+   -- the ARGUMENT at the call site (`the number of keys of sPeers`, which does
+   -- not parse - OXT-ENGINE-NOTES 1.7) and never reached uiStatus at all, and
+   -- the guard credited to the kit was dht-chat's own wxSetStatus wrapper - the
+   -- master had no existence check until the same commit that added this pin.
+   -- What a guarded call site WOULD do if the defaultStack diverged is fail
+   -- silently, which is the argument for a gate rather than for more guards.
+   -- See OXT-ENGINE-NOTES 5.3, now classed DOCUMENTED.
+   --
+   -- The pin is holde-em's idiom, engine-proven there, and its comment names
+   -- this exact hazard. The existence check stays as well: a demo may call the
+   -- status line before its chrome is built, and a cosmetic line must never
+   -- take down a poll chain.
+   set the defaultStack to the short name of this stack
+   if there is no field "uiStatus" then
+      exit uiStatus
+   end if
+   put pText into field "uiStatus"
+   if pKind is "ok" then
+      set the foregroundColor of field "uiStatus" to kUiOk
+   else if pKind is "warn" then
+      set the foregroundColor of field "uiStatus" to kUiWarn
+   else if pKind is "bad" then
+      set the foregroundColor of field "uiStatus" to kUiBad
+   else
+      set the foregroundColor of field "uiStatus" to kUiInkSoft
+   end if
+end uiStatus
+
+-- A static caption at a FIXED rect (idempotent, borderless, transparent).
+-- Use uiWrap instead when the text may wrap or the exact height matters.
+command uiLabel pName, pText, pRect, pSize
+   if there is no field pName then
+      create field
+      set the name of the last field to pName
+   end if
+   set the rect of field pName to pRect
+   set the lockText of field pName to true
+   set the borderWidth of field pName to 0
+   set the opaque of field pName to false
+   set the threeD of field pName to false
+   set the textSize of field pName to pSize
+   set the foregroundColor of field pName to kUiInk
+   put pText into field pName
+end uiLabel
+
+-- A caption FIT to its measured text height (top pinned). The fit does
+-- double duty: it prevents clipping (hand-sized rects clipped text on a
+-- real Windows pass), and it makes `the height of field` equal the TEXT
+-- height, which midline centering relies on. GUARD: only resize on a sane
+-- measurement - a 0/blank formattedHeight (possible before the window is
+-- fully realized) would collapse the label. Empty labels are skipped
+-- (they receive their text later).
+command uiWrap pName, pText, pRect, pSize
+   local tOldDelim, tTop, tFH
+   uiLabel pName, pText, pRect, pSize
+   if pText is not empty then
+      put the itemDelimiter into tOldDelim
+      set the itemDelimiter to comma
+      put item 2 of pRect into tTop
+      set the itemDelimiter to tOldDelim
+      put the formattedHeight of field pName into tFH
+      if tFH > 0 then
+         set the height of field pName to tFH
+         set the top of field pName to tTop
+      end if
+   end if
+end uiWrap
+
+-- A small, muted caption (hints, toggle descriptions, empty states).
+command uiCap pName, pText, pRect
+   uiWrap pName, pText, pRect, 10
+   set the foregroundColor of field pName to kUiMuted
+end uiCap
+
+-- A numbered bold section header with a hairline divider placed below the
+-- label's ACTUAL (fit-to-text) bottom, so it tracks the real header
+-- height on any platform's line metrics.
+command uiSection pName, pText, pRect
+   local tOldDelim, tL, tR, tB
+   uiWrap pName, pText, pRect, 13
+   set the textStyle of field pName to "bold"
+   put the itemDelimiter into tOldDelim
+   set the itemDelimiter to comma
+   put item 1 of pRect into tL
+   put item 3 of pRect into tR
+   set the itemDelimiter to tOldDelim
+   put the bottom of field pName into tB
+   uiGfx (pName & "Line"), (tL & comma & (tB + 1) & comma & tR & comma & (tB + 2))
+   set the style of graphic (pName & "Line") to "rectangle"
+   set the filled of graphic (pName & "Line") to true
+   set the backgroundColor of graphic (pName & "Line") to kUiCardLine
+   set the lineSize of graphic (pName & "Line") to 0
+end uiSection
+
+-- A one-line entry field, mono and flat ("modern input" chrome instead of
+-- the engine's sunken-3D default), because hex, addresses and paths are
+-- what this suite's demos edit.
+command uiInput pName, pRect
+   if there is no field pName then
+      create field
+      set the name of the last field to pName
+   end if
+   set the rect of field pName to pRect
+   set the lockText of field pName to false
+   set the traversalOn of field pName to true
+   set the threeD of field pName to false
+   set the borderWidth of field pName to 1
+   set the borderColor of field pName to kUiFieldLine
+   set the opaque of field pName to true
+   set the backgroundColor of field pName to kUiCard
+   -- 4-item margins form ONLY: OXT ignored the single-number form on a
+   -- real engine pass
+   set the margins of field pName to "6,6,6,6"
+   set the textSize of field pName to 11
+   set the textFont of field pName to uiMonoFont()
+end uiInput
+
+-- A read-only output/log area: mono, flat, scrolling, hairline-bordered.
+command uiArea pName, pRect
+   if there is no field pName then
+      create field
+      set the name of the last field to pName
+   end if
+   set the rect of field pName to pRect
+   set the lockText of field pName to true
+   set the traversalOn of field pName to false
+   set the threeD of field pName to false
+   set the borderWidth of field pName to 1
+   set the borderColor of field pName to kUiCardLine
+   set the opaque of field pName to true
+   set the backgroundColor of field pName to kUiCard
+   set the margins of field pName to "6,6,6,6"
+   set the vScrollbar of field pName to true
+   set the textSize of field pName to 10
+   set the textFont of field pName to uiMonoFont()
+end uiArea
+
+-- A row-selectable table: uiArea plus list behavior and tab stops
+-- ("230,340"-style comma lists). Pair it with a uiLabel header carrying
+-- the same tabStops, set by the adopter.
+command uiTable pName, pRect, pTabStops
+   uiArea pName, pRect
+   set the listBehavior of field pName to true
+   if pTabStops is not empty then
+      set the tabStops of field pName to pTabStops
+   end if
+end uiTable
+
+command uiButton pName, pLabel, pRect
+   if there is no button pName then
+      create button
+      set the name of the last button to pName
+   end if
+   set the rect of button pName to pRect
+   set the label of button pName to pLabel
+end uiButton
+
+-- A script-managed checkbox: autoHilite OFF because the family drives
+-- toggle state from script locals (a mode the environment cannot honour
+-- must never stay silently armed - the quickshare pill lesson), so the
+-- hilite is set explicitly by the adopter's state machine.
+command uiCheckbox pName, pLabel, pRect
+   uiButton pName, pLabel, pRect
+   set the style of button pName to "checkbox"
+   set the autoHilite of button pName to false
+end uiCheckbox
+
+-- Create-or-reuse a named graphic: the chrome layer (cards, pills,
+-- dividers, drop targets). Created BEFORE the controls that sit on it, so
+-- it stays behind them in z-order. roundRect + antialiased by default;
+-- callers restyle.
+command uiGfx pName, pRect
+   if there is no graphic pName then
+      create graphic
+      set the name of the last graphic to pName
+   end if
+   set the rect of graphic pName to pRect
+   set the style of graphic pName to "roundRect"
+   set the antialiased of graphic pName to true
+end uiGfx
+
+-- A dashboard card: a rounded, hairline-bordered, softly shadowed panel
+-- placed BEHIND a group of controls. It only groups visually; clicks on
+-- it fall through to the adopter's `default: pass mouseUp`.
+command uiPanel pName, pRect
+   local tShadow, tErr
+   uiGfx pName, pRect
+   set the roundRadius of graphic pName to 14
+   set the filled of graphic pName to true
+   set the backgroundColor of graphic pName to kUiCard
+   set the lineSize of graphic pName to 1
+   -- a graphic strokes its outline in the foregroundColor; borderColor is
+   -- set too so whichever the engine honours, the hairline lands
+   set the foregroundColor of graphic pName to kUiCardLine
+   set the borderColor of graphic pName to kUiCardLine
+   -- soft drop shadow is an LC-9-era feature, so it is a PURE
+   -- enhancement: an engine without it just skips it (the try) and the
+   -- hairline still separates the card from the page
+   try
+      put "90,98,114" into tShadow["color"]
+      put 30 into tShadow["opacity"]
+      put 10 into tShadow["size"]
+      put 0 into tShadow["spread"]
+      put 2 into tShadow["distance"]
+      put 90 into tShadow["angle"]
+      set the dropShadow of graphic pName to tShadow
+   catch tErr
+   end try
+end uiPanel
+
+-- A status pill: rounded chip + centered label, colored by state kind -
+-- "ok" green, "wait" amber, "bad" red, anything else the muted on-band
+-- blue. The adopter repaints it from ONE place so its handlers cannot
+-- disagree about the colors (the nocloud Tor-pill discipline).
+command uiPill pName, pText, pRect, pKind
+   local tOldDelim, tTop, tBot, tFH
+   put the itemDelimiter into tOldDelim
+   set the itemDelimiter to comma
+   put item 2 of pRect into tTop
+   put item 4 of pRect into tBot
+   set the itemDelimiter to tOldDelim
+   uiGfx (pName & "Bg"), pRect
+   set the roundRadius of graphic (pName & "Bg") to (tBot - tTop)
+   set the filled of graphic (pName & "Bg") to true
+   set the lineSize of graphic (pName & "Bg") to 0
+   if pKind is "ok" then
+      set the backgroundColor of graphic (pName & "Bg") to "205,240,214"
+   else if pKind is "wait" then
+      set the backgroundColor of graphic (pName & "Bg") to "250,240,199"
+   else if pKind is "bad" then
+      set the backgroundColor of graphic (pName & "Bg") to "243,215,213"
+   else
+      set the backgroundColor of graphic (pName & "Bg") to "31,64,116"
+   end if
+   uiLabel pName, pText, pRect, 10
+   set the textAlign of field pName to "center"
+   if pKind is "ok" then
+      set the foregroundColor of field pName to "22,101,52"
+   else if pKind is "wait" then
+      set the foregroundColor of field pName to "133,98,14"
+   else if pKind is "bad" then
+      set the foregroundColor of field pName to "135,44,38"
+   else
+      set the foregroundColor of field pName to kUiAccentSub
+   end if
+   -- center the label on the chip midline by measured height
+   put the formattedHeight of field pName into tFH
+   if tFH > 0 and tFH < (tBot - tTop) then
+      set the height of field pName to tFH
+      set the top of field pName to (tTop + ((tBot - tTop - tFH) div 2))
+   end if
+end uiPill
+
+-- Click-to-copy feedback: flash the button's label to "Copied!" for
+-- 1200 ms, then restore the real label (stashed in uRealLabel).
+command uiCopyFlash pBtn
+   if there is no button pBtn then
+      exit uiCopyFlash
+   end if
+   if the uRealLabel of button pBtn is empty then
+      set the uRealLabel of button pBtn to the label of button pBtn
+   end if
+   set the label of button pBtn to "Copied!"
+   send ("uiCopyFlashReset" && quote & pBtn & quote) to me in 1200 milliseconds
+end uiCopyFlash
+
+command uiCopyFlashReset pBtn
+   -- Pinned for the same reason uiStatus is: this one arrives 1200ms later by
+   -- `send`, so the defaultStack is whatever is current THEN, not the stack
+   -- that flashed the button. Its existence guard means the failure is silent
+   -- rather than loud - the label just never comes back, or comes back on
+   -- another stack's button - which is why it needed finding rather than
+   -- reporting itself.
+   set the defaultStack to the short name of this stack
+   if there is no button pBtn then
+      exit uiCopyFlashReset
+   end if
+   if the uRealLabel of button pBtn is not empty then
+      set the label of button pBtn to the uRealLabel of button pBtn
+   end if
+end uiCopyFlashReset
+
+-- The honesty/custody footer every demo carries: what the stack is, what
+-- it is not, and its engine-evidence state.
+command uiFooter pText, pRect
+   uiWrap "uiFooter", pText, pRect, 11
+   set the textStyle of field "uiFooter" to "italic"
+   set the foregroundColor of field "uiFooter" to kUiMuted
+end uiFooter
+-- ---- contextual menus -------------------------------------------------------
+--
+-- A RIGHT-CLICK MENU, as one hidden popup button per menu.
+--
+-- The engine's contextual menu is a BUTTON whose style is "menu" and whose
+-- menuMode is "popup": its text is the item list, one per line, `popup`
+-- shows it at a point, and choosing an item sends `menuPick` with the item's
+-- LABEL. The button needs no script - with no handler of its own the message
+-- walks the hierarchy and arrives at the card and then the stack, which is
+-- where an adopter's router already lives.
+--
+-- OPT-IN, AND THAT IS DELIBERATE. This block is carried byte-identical by
+-- every demo in the suite, so a kit that BUILT a menu would change eighteen
+-- stacks to serve one. Nothing here runs unless an adopter calls
+-- uiContextMenu, and a demo that never does is unchanged in behaviour.
+--
+-- NONE OF THIS HAS RUN ON AN ENGINE. `popup`, `menuMode` and `menuPick` are
+-- documented LiveCode and OpenXTalk is a fork of it, but this suite has never
+-- exercised a menu and the headless runners model no mouse button at all - so
+-- an adopter's right-click handler belongs in a `try`, and losing the menu
+-- must never cost the ordinary click. uiPopupMenu answers whether it worked
+-- rather than throwing, so the caller can decide.
+
+command uiContextMenu pName, pItems
+   -- One hidden popup button, created once and refilled on every call so a
+   -- menu can change with the screen it belongs to. The rect is small and
+   -- inside the window because a stack's controls are measured by
+   -- tools/check-stack-size.py whether they are visible or not.
+   if there is no button pName then
+      -- THE KIT'S OWN IDIOM, and not `create button pName`. Every other
+      -- builder in this block creates the control unnamed and then names the
+      -- last one, which is the spelling the family's headless runners model
+      -- and the one every adopter has already been through an engine with.
+      create button
+      set the name of the last button to pName
+   end if
+   set the style of button pName to "menu"
+   set the menuMode of button pName to "popup"
+   set the text of button pName to pItems
+   set the rect of button pName to "2,2,18,18"
+   set the visible of button pName to false
+end uiContextMenu
+
+function uiPopupMenu pName
+   -- WHICH menu, recorded before it opens. menuPick carries the item's label
+   -- and nothing else, so an adopter with two menus would otherwise have to
+   -- keep every label in the stack globally unique - a constraint that is
+   -- invisible until the day two screens both want "Copy".
+   --
+   -- Answers true or false rather than throwing: on an engine without popup
+   -- menus the right thing is for the click to do nothing, not for the
+   -- adopter's mouseDown to die.
+   local tError
+   if there is no button pName then
+      return false
+   end if
+   set the uUiMenu of this stack to pName
+   try
+      popup button pName at the clickLoc
+   catch tError
+      set the uUiMenu of this stack to empty
+      return false
+   end try
+   return true
+end uiPopupMenu
+
+function uiMenuSource
+   -- The name of the menu the last menuPick came from.
+   return the uUiMenu of this stack
+end uiMenuSource
+
+-- ==== SUITE UI KIT v2 END ====
+
+-- ---- lifecycle --------------------------------------------------------------
+
+on preOpenStack
+   -- THE ONE LINE AN EMBEDDING STACK OWES THE LIBRARY. See the header.
+   mqttInitialize
+end preOpenStack
+
+on openStack
+   mdBuild
+   mdStart
+   -- LAST, not first: the check reads the state mdStart establishes (the
+   -- callbacks, the armed dashboard), and asserting before it would test
+   -- nothing.
+   mdScRun
+end openStack
+
+on closeStack
+   mdStop
+end closeStack
+
+-- ---- self-building UI (idempotent; rebuilds on a version bump) --------------
+
+command mdBuild
+   -- A stack SAVED with this UI already built does not need it built again, and
+   -- rebuilding one that was saved by an OLDER version must start from a clean
+   -- card - otherwise a control this version dropped stays on screen forever,
+   -- wired to nothing.
+   if the uMdUiVersion of this stack is kMdUiVersion \
+         and there is a field "mdHost" then
+      exit mdBuild
+   end if
+
+   mdClearGeneratedUI
+   lock screen
+
+   uiChrome "libMQTTxt - MQTT Dashboard", 1000, 620, 34
+
+   -- Panels first, so they sit BEHIND the controls placed on them.
+   uiPanel "mdBrokerPanel", "16,66,494,336"
+   uiPanel "mdSubPanel", "16,348,494,556"
+   uiPanel "mdPubPanel", "506,66,984,284"
+   uiPanel "mdLogPanel", "506,296,984,556"
+
+   -- 1. Broker
+   uiSection "mdSecBroker", "1. Broker", "32,78,370,98"
+   -- Through mdSetPill, not uiPill directly: the pill's rect and its four
+   -- state colours get exactly ONE owner, so a rebuild here and a repaint from
+   -- a callback cannot disagree about where it sits or what it says.
+   mdSetPill "offline", "bad"
+
+   uiCap "mdHostCap", "Host", "32,110,340,126"
+   uiInput "mdHost", "32,128,340,152"
+   uiCap "mdPortCap", "Port", "352,110,478,126"
+   uiInput "mdPort", "352,128,478,152"
+
+   uiCap "mdClientCap", "Client ID (blank generates one)", "32,160,478,176"
+   uiInput "mdClient", "32,178,478,202"
+
+   uiCap "mdUserCap", "Username (optional)", "32,210,250,226"
+   uiInput "mdUser", "32,228,250,252"
+   uiCap "mdPassCap", "Password (needs a username)", "262,210,478,226"
+   uiInput "mdPass", "262,228,478,252"
+
+   uiCheckbox "mdTLS", "TLS", "32,260,128,282"
+   uiCheckbox "mdVerify", "Verify cert", "136,260,266,282"
+   uiCheckbox "mdAuto", "Auto-reconnect", "274,260,430,282"
+
+   uiButton "mdConnect", "Connect", "32,296,146,320"
+   uiButton "mdDisconnect", "Disconnect", "154,296,268,320"
+   uiButton "mdSelfTest", "Self-test", "276,296,390,320"
+
+   -- 2. Subscribe
+   uiSection "mdSecSub", "2. Subscribe", "32,360,478,380"
+   uiCap "mdTopicCap", "Topic filter (+ and # allowed)", "32,392,340,408"
+   uiInput "mdTopic", "32,410,340,434"
+   uiCap "mdQoSCap", "QoS", "352,392,478,408"
+   uiInput "mdQoS", "352,410,478,434"
+   uiButton "mdSubscribe", "Subscribe", "32,442,146,466"
+   uiButton "mdUnsubscribe", "Unsubscribe", "154,442,278,466"
+   uiCap "mdSubsCap", "Active subscriptions", "32,474,478,490"
+   uiArea "mdSubs", "32,492,478,544"
+
+   -- 3. Publish
+   uiSection "mdSecPub", "3. Publish", "522,78,968,98"
+   uiCap "mdPubTopicCap", "Topic (no wildcards)", "522,110,968,126"
+   uiInput "mdPubTopic", "522,128,968,152"
+   uiCap "mdPubMsgCap", "Payload", "522,160,968,176"
+   uiInput "mdPubMsg", "522,178,968,218"
+   uiCap "mdPubQoSCap", "QoS", "522,226,640,242"
+   uiInput "mdPubQoS", "522,244,640,268"
+   uiCheckbox "mdPubRetain", "Retain", "652,246,790,266"
+   uiButton "mdPublish", "Publish", "800,244,968,268"
+
+   -- 4. Traffic
+   uiSection "mdSecLog", "4. Traffic", "522,308,968,328"
+   uiCap "mdStats", "no connection", "522,336,968,352"
+   uiCap "mdMsgCap", "Received messages", "522,358,968,374"
+   uiArea "mdMessages", "522,376,968,448"
+   uiCap "mdLogCap", "Library log", "522,456,968,472"
+   uiArea "mdLog", "522,474,968,544"
+
+   uiFooter "libMQTTxt " & mdLibVersion() & " - a demo of the library, not a " \
+         & "production client. Verified statically; needs an OXT pass: no " \
+         & "line of this stack has run on an engine against a live broker.", \
+         "16,566,984,608"
+
+   -- Seed the form. Done here rather than in the builders so a rebuild on
+   -- reopen does not wipe what the operator typed.
+   if field "mdHost" is empty then
+      put kMdHost into field "mdHost"
+      put kMdPort into field "mdPort"
+      put kMdTopic into field "mdTopic"
+      put "0" into field "mdQoS"
+      put kMdTopic into field "mdPubTopic"
+      put "hello from libMQTTxt" into field "mdPubMsg"
+      put "0" into field "mdPubQoS"
+   end if
+
+   set the uMdUiVersion of this stack to kMdUiVersion
+   unlock screen
+end mdBuild
+
+-- Remove what a PREVIOUS version of mdBuild generated, so a version bump
+-- starts from a clean card. Graphics are included, unlike the shortest form of
+-- this handler in the family: this demo's look is built from uiPanel cards,
+-- uiSection divider lines and a uiPill chip, and every one of those is a
+-- graphic. Dropping only fields and buttons would leave the old layout's
+-- cards and dividers behind the new one's controls.
+command mdClearGeneratedUI
+   local tI
+   lock screen
+   repeat with tI = the number of fields of this card down to 1
+      if the short name of field tI of this card begins with "md" then
+         delete field tI of this card
+      end if
+   end repeat
+   repeat with tI = the number of buttons of this card down to 1
+      if the short name of button tI of this card begins with "md" then
+         delete button tI of this card
+      end if
+   end repeat
+   repeat with tI = the number of graphics of this card down to 1
+      if the short name of graphic tI of this card begins with "md" then
+         delete graphic tI of this card
+      end if
+   end repeat
+   unlock screen
+end mdClearGeneratedUI
+
+-- ---- start / stop -----------------------------------------------------------
+
+command mdStart
+   put false into sConnected
+   put empty into sConnKey
+   put 0 into sRecv
+   put false into sTLS
+   put false into sAuto
+   put false into sRetain
+   -- Verification defaults ON, matching the library's own fail-closed default.
+   put true into sVerify
+   mdPaintToggles
+
+   -- Callbacks BEFORE anything can connect, so nothing that arrives during a
+   -- handshake is dropped. The target is explicit even though the library would
+   -- capture this stack anyway: an explicit target is one less thing to reason
+   -- about when the handlers move.
+   mqttSetCallbackTarget the long id of me
+   mqttSetLogCallback "mdOnLog"
+   mqttSetMessageCallback "mdOnMessage"
+   mqttSetStateChangeCallback "mdOnState"
+   mqttSetReconnectCallback "mdOnReconnect"
+
+   put "true" into sDashOn
+   send "mdDashOnce" to me in kMdDashMs milliseconds
+
+   uiStatus "Ready - edit the broker details and press Connect.", empty
+   mdLog "libMQTTxt " & mdLibVersion() & " ready (embedded in this stack)"
+end mdStart
+
+command mdStop
+   put false into sDashOn
+   -- The one mandatory teardown: without it the sockets and the keep-alive
+   -- timers outlive this window.
+   mqttCleanupAll
+end mdStop
+
+-- ---- the dashboard tick -----------------------------------------------------
+
+command mdDashOnce
+   -- PIN THE STACK FIRST. This handler arrives from `send ... in`, where an
+   -- unqualified control reference resolves against the DEFAULTSTACK rather
+   -- than the stack whose script is running (OXT-ENGINE-NOTES 5.3). Pinning at
+   -- the timer ENTRY POINT covers everything downstream.
+   set the defaultStack to the short name of this stack
+
+   local tStats, tLine, tErr
+   try
+      if sConnKey is empty then
+         put "no connection" into tLine
+      else
+         put mqttGetStatistics(mdHostOf(sConnKey), mdPortOf(sConnKey)) into tStats
+         put "sent " & tStats["messagesSent"] & " (" & tStats["bytesSent"] \
+               & "B)  received " & tStats["messagesReceived"] & " (" \
+               & tStats["bytesReceived"] & "B)  reconnects " \
+               & tStats["reconnections"] & "  delivered here " & sRecv into tLine
+      end if
+      put tLine into field "mdStats"
+   catch tErr
+      -- A cosmetic line must never cost the tick; the chain below is what
+      -- keeps the window honest about the connection.
+      put "dashboard error:" && tErr into field "mdStats"
+   end try
+
+   if sDashOn is "true" then
+      send "mdDashOnce" to me in kMdDashMs milliseconds
+   end if
+end mdDashOnce
+
+-- ---- input routing ----------------------------------------------------------
+
+on mouseUp
+   local tName
+   put the short name of the target into tName
+
+   switch tName
+      case "mdConnect"
+         mdConnectNow
+         break
+      case "mdDisconnect"
+         mdDisconnectNow
+         break
+      case "mdSelfTest"
+         mdRunSelfTest
+         break
+      case "mdSubscribe"
+         mdSubscribeNow
+         break
+      case "mdUnsubscribe"
+         mdUnsubscribeNow
+         break
+      case "mdPublish"
+         mdPublishNow
+         break
+      case "mdTLS"
+         mdToggle "sTLS"
+         break
+      case "mdVerify"
+         mdToggle "sVerify"
+         break
+      case "mdAuto"
+         mdToggle "sAuto"
+         break
+      case "mdPubRetain"
+         mdToggle "sRetain"
+         break
+      default
+         pass mouseUp
+   end switch
+end mouseUp
+
+-- The checkboxes are script-driven (the kit sets autoHilite off), so state
+-- lives here and the hilite is painted from ONE place - the handlers cannot
+-- disagree about what is ticked.
+command mdToggle pWhich
+   switch pWhich
+      case "sTLS"
+         put (sTLS is not "true") into sTLS
+         -- Moving to TLS with verification off is the combination worth a
+         -- word: it looks secure and authenticates nobody.
+         if sTLS is "true" and mdTrim(field "mdPort") is kMdPort then
+            put 8883 into field "mdPort"
+         end if
+         break
+      case "sVerify"
+         put (sVerify is not "true") into sVerify
+         if sVerify is not "true" then
+            mdLog "WARNING: certificate verification OFF - encrypted, but " \
+                  & "authenticates nobody"
+         end if
+         break
+      case "sAuto"
+         put (sAuto is not "true") into sAuto
+         break
+      case "sRetain"
+         put (sRetain is not "true") into sRetain
+         break
+   end switch
+   mdPaintToggles
+end mdToggle
+
+command mdPaintToggles
+   set the hilite of button "mdTLS" to (sTLS is "true")
+   set the hilite of button "mdVerify" to (sVerify is "true")
+   set the hilite of button "mdAuto" to (sAuto is "true")
+   set the hilite of button "mdPubRetain" to (sRetain is "true")
+end mdPaintToggles
+
+-- ---- actions ----------------------------------------------------------------
+
+command mdConnectNow
+   local tHost, tPort, tResult
+
+   put mdTrim(field "mdHost") into tHost
+   put mdTrim(field "mdPort") into tPort
+
+   if tHost is empty then
+      uiStatus "Enter a broker host first.", "bad"
+      exit mdConnectNow
+   end if
+
+   if sConnected is "true" then
+      uiStatus "Already connected - disconnect first.", "warn"
+      exit mdConnectNow
+   end if
+
+   put tHost & ":" & tPort into sConnKey
+   uiStatus "Connecting to" && sConnKey & "...", empty
+   mdSetPill "connecting", "wait"
+
+   put mqttConnect(tHost, tPort, mdTrim(field "mdClient"), \
+         mdTrim(field "mdUser"), field "mdPass", 60, (sTLS is "true"), true, \
+         empty, empty, 0, false, (sVerify is "true"), (sAuto is "true"), \
+         empty) into tResult
+
+   -- "OK" means the socket open was INITIATED. Connected is what CONNACK
+   -- says, and that arrives at mdOnState.
+   if tResult is not "OK" then
+      uiStatus tResult, "bad"
+      mdSetPill "offline", "bad"
+      put empty into sConnKey
+      mdLog tResult
+   end if
+end mdConnectNow
+
+command mdDisconnectNow
+   if sConnKey is empty then
+      uiStatus "Nothing to disconnect.", "warn"
+      exit mdDisconnectNow
+   end if
+
+   mqttDisconnect mdHostOf(sConnKey), mdPortOf(sConnKey)
+   put false into sConnected
+   put empty into sConnKey
+   mdSetPill "offline", "bad"
+   mdRefreshSubs
+   uiStatus "Disconnected.", empty
+end mdDisconnectNow
+
+command mdSubscribeNow
+   local tResult
+   if sConnected is not "true" then
+      uiStatus "Connect before subscribing.", "warn"
+      exit mdSubscribeNow
+   end if
+
+   put mqttSubscribe(mdHostOf(sConnKey), mdPortOf(sConnKey), \
+         mdTrim(field "mdTopic"), mdTrim(field "mdQoS")) into tResult
+
+   if tResult is "OK" then
+      uiStatus "Subscribed to" && mdTrim(field "mdTopic") & ".", "ok"
+   else
+      uiStatus tResult, "bad"
+   end if
+   mdRefreshSubs
+end mdSubscribeNow
+
+command mdUnsubscribeNow
+   local tResult
+   if sConnected is not "true" then
+      uiStatus "Connect before unsubscribing.", "warn"
+      exit mdUnsubscribeNow
+   end if
+
+   put mqttUnsubscribe(mdHostOf(sConnKey), mdPortOf(sConnKey), \
+         mdTrim(field "mdTopic")) into tResult
+
+   if tResult is "OK" then
+      uiStatus "Unsubscribed from" && mdTrim(field "mdTopic") & ".", "ok"
+   else
+      uiStatus tResult, "bad"
+   end if
+   mdRefreshSubs
+end mdUnsubscribeNow
+
+command mdPublishNow
+   local tResult
+   if sConnected is not "true" then
+      uiStatus "Connect before publishing.", "warn"
+      exit mdPublishNow
+   end if
+
+   put mqttPublish(mdHostOf(sConnKey), mdPortOf(sConnKey), \
+         mdTrim(field "mdPubTopic"), field "mdPubMsg", \
+         mdTrim(field "mdPubQoS"), (sRetain is "true")) into tResult
+
+   if tResult is "OK" then
+      uiStatus "Published to" && mdTrim(field "mdPubTopic") & ".", "ok"
+   else
+      uiStatus tResult, "bad"
+   end if
+end mdPublishNow
+
+command mdRunSelfTest
+   local tReport
+   put mqttSelfTest() into tReport
+   mdLog "---- mqttSelfTest ----"
+   mdLog tReport
+   if tReport contains "All tests PASSED" then
+      uiStatus "Library self-test passed (see the log).", "ok"
+   else
+      uiStatus "Library self-test FAILED - see the log.", "bad"
+   end if
+end mdRunSelfTest
+
+command mdRefreshSubs
+   local tSubs
+   set the defaultStack to the short name of this stack
+
+   if sConnKey is empty then
+      put "(not connected)" into field "mdSubs"
+      exit mdRefreshSubs
+   end if
+
+   -- One topic per line already: mqttGetSubscriptions answers `the keys of`
+   -- the subscription array.
+   put mqttGetSubscriptions(mdHostOf(sConnKey), mdPortOf(sConnKey)) into tSubs
+   if tSubs is empty then
+      put "(none)" into field "mdSubs"
+      exit mdRefreshSubs
+   end if
+   put tSubs into field "mdSubs"
+end mdRefreshSubs
+
+-- ---- library callbacks ------------------------------------------------------
+
+on mdOnMessage pTopic, pMessage
+   set the defaultStack to the short name of this stack
+   add 1 to sRecv
+   put pTopic & "  " & mdOneLine(pMessage) & return after field "mdMessages"
+   set the vscroll of field "mdMessages" to the formattedHeight of field "mdMessages"
+end mdOnMessage
+
+on mdOnLog pMessage
+   mdLog pMessage
+end mdOnLog
+
+on mdOnState pState, pHost, pPort, pReason
+   set the defaultStack to the short name of this stack
+
+   switch pState
+      case "connected"
+         put "true" into sConnected
+         mdSetPill "online", "ok"
+         uiStatus "Connected to" && pHost & ":" & pPort & ".", "ok"
+         mdRefreshSubs
+         break
+      case "connecting"
+         mdSetPill "connecting", "wait"
+         break
+      case "disconnected"
+         put false into sConnected
+         mdSetPill "offline", "bad"
+         uiStatus "Disconnected:" && pReason, "warn"
+         mdRefreshSubs
+         break
+      case "error"
+         put false into sConnected
+         mdSetPill "error", "bad"
+         uiStatus "Error:" && pReason, "bad"
+         break
+   end switch
+end mdOnState
+
+on mdOnReconnect pEvent, pHost, pPort, pAttempts
+   set the defaultStack to the short name of this stack
+   if pEvent is "attempting" then
+      mdSetPill "retry " & pAttempts, "wait"
+      uiStatus "Reconnecting to" && pHost & ":" & pPort && "(attempt" \
+            && pAttempts & ")...", "warn"
+   else if pEvent is "success" then
+      uiStatus "Reconnected to" && pHost & ":" & pPort & ".", "ok"
+   end if
+end mdOnReconnect
+
+-- ---- small helpers ----------------------------------------------------------
+
+command mdSetPill pText, pKind
+   set the defaultStack to the short name of this stack
+   uiPill "mdConnPill", pText, "386,78,478,98", pKind
+end mdSetPill
+
+command mdLog pMessage
+   -- Pinned: the library's keep-alive and reconnect timers reach this handler
+   -- through mdOnLog, and a delayed handler's unqualified field reference
+   -- resolves against the defaultStack (OXT-ENGINE-NOTES 5.3).
+   set the defaultStack to the short name of this stack
+   if there is no field "mdLog" then
+      exit mdLog
+   end if
+   put pMessage & return after field "mdLog"
+   set the vscroll of field "mdLog" to the formattedHeight of field "mdLog"
+end mdLog
+
+function mdLibVersion
+   local tText, tPos
+   put mqttTestLibrary() into tText
+   -- "MQTT Library v2.12.0 loaded successfully" -> "v2.12.0"
+   put offset(" v", tText) into tPos
+   if tPos = 0 then
+      return "(version unknown)"
+   end if
+   return word 1 of (char (tPos + 1) to -1 of tText)
+end mdLibVersion
+
+-- The connection key is "host:port" and the host may itself be a bracketed
+-- IPv6 literal, so the split is at the LAST colon rather than the first
+-- (OXT-ENGINE-NOTES 6.2: splitting a socket id on ":" and taking item 1 yields
+-- EMPTY for a bare IPv6 id like ::1:54321, and a guard built that way fails
+-- OPEN). The scan lives in one place so the two halves cannot disagree about
+-- where the key divides.
+function mdLastColon pKey
+   local tPos, tI
+   put 0 into tPos
+   repeat with tI = 1 to the number of chars of pKey
+      if char tI of pKey is ":" then
+         put tI into tPos
+      end if
+   end repeat
+   return tPos
+end mdLastColon
+
+function mdHostOf pKey
+   local tPos
+   put mdLastColon(pKey) into tPos
+   if tPos = 0 then
+      return pKey
+   end if
+   return char 1 to (tPos - 1) of pKey
+end mdHostOf
+
+function mdPortOf pKey
+   local tPos
+   put mdLastColon(pKey) into tPos
+   if tPos = 0 then
+      return empty
+   end if
+   return char (tPos + 1) to -1 of pKey
+end mdPortOf
+
+function mdTrim pText
+   local tOut
+   put pText into tOut
+   repeat while tOut begins with " "
+      delete char 1 of tOut
+   end repeat
+   repeat while tOut ends with " "
+      delete char -1 of tOut
+   end repeat
+   -- A field's contents end in a return the operator never typed; left in, it
+   -- becomes part of a topic name or a host and the failure reads as a typo
+   -- nobody made.
+   repeat while tOut ends with return
+      delete char -1 of tOut
+   end repeat
+   return tOut
+end mdTrim
+
+-- Payloads are binary-safe, so a message may carry returns and tabs that would
+-- break the one-line-per-message log. Flatten for display only.
+function mdOneLine pText
+   local tOut, tChar, tCode
+   repeat for each char tChar in pText
+      put charToNum(tChar) into tCode
+      if tCode < 32 then
+         put "." after tOut
+      else
+         put tChar after tOut
+      end if
+   end repeat
+   if the number of chars of tOut > 120 then
+      return char 1 to 117 of tOut & "..."
+   end if
+   return tOut
+end mdOneLine
+
+-- ==== DEMO SELF-CHECK v1 BEGIN (verbatim copy; master: tools/demo-selfcheck.livecodescript; gate: tools/check-demo-selfcheck-drift.py) ====
+-- The sentinel is a CONSTANT so the probe compares against one spelling; a
+-- literal repeated at the write and the read is a check that can pass while
+-- disagreeing with itself.
+constant kScProbe = "self-check: delayed write reached the status line"
+local sScLines          -- the whole block, kept so a Copy button has something
+local sScPassed, sScFailed, sScSkipped
+local sScLogField       -- the adopting demo's own log field, set by scBegin
+
+command scBegin pLogField
+   put pLogField into sScLogField
+   put empty into sScLines
+   put 0 into sScPassed
+   put 0 into sScFailed
+   put 0 into sScSkipped
+   scLine "== boot self-check (nothing is hosted, connected, or bound) =="
+end scBegin
+
+-- Each line is LOGGED as it is made, not accumulated and flushed at the end.
+-- The first draft did both - a flush after the synchronous half and another
+-- after the probe - which printed every synchronous line twice.
+command scLine pText
+   put pText & return after sScLines
+   -- pin the stack: scFinish reaches here from a `send ... in` tick, and the
+   -- field is named unqualified (OXT-ENGINE-NOTES 5.3)
+   set the defaultStack to the short name of this stack
+   if sScLogField is empty or there is no field sScLogField then
+      exit scLine
+   end if
+   put pText & return after field sScLogField
+   set the vscroll of field sScLogField to the formattedHeight of field sScLogField
+end scLine
+
+command scAssert pName, pOk
+   if pOk then
+      add 1 to sScPassed
+      scLine "PASS  " & pName
+   else
+      add 1 to sScFailed
+      scLine "FAIL  " & pName
+   end if
+end scAssert
+
+-- SKIP, never FAIL, for an absent extension: a missing member is an
+-- environment, and only a present-and-broken member is a defect.
+command scSkip pName, pReason
+   add 1 to sScSkipped
+   scLine "SKIP  " & pName & " (" & pReason & ")"
+end scSkip
+
+-- An empty value prints as nothing, which reads as a missing check rather than
+-- an answer of empty; every observed value in a self-check goes through here.
+-- This is the playLoudness lesson (OXT-ENGINE-NOTES 5.4) as a helper: a check
+-- that reports only its own name costs a whole engine pass to diagnose.
+function scShow pValue
+   if pValue is empty then
+      return "empty"
+   end if
+   return pValue
+end scShow
+
+-- Returns the comma-list of control names in pList that do not exist, or empty.
+-- The adopter passes EVERY control name its own script references, derived from
+-- the source rather than hand-picked: a missing control is not cosmetic, it is
+-- the "Chunk: error in object expression" class, and finding it at boot beats
+-- finding it when somebody clicks.
+function scMissing pList
+   local tName, tMissing, tC, tFound
+   set the defaultStack to the short name of this stack
+   repeat for each item tName in pList
+      -- ALL FOUR CONTROL TYPES. The kit builds fields (uiLabel/uiWrap/uiCap/
+      -- uiSection/uiInput/uiArea/uiTable), buttons (uiButton/uiCheckbox) AND
+      -- GRAPHICS (uiGfx/uiPanel/uiPill). The first version of this asked only
+      -- about fields and buttons, so every uiPill a demo builds - the Tor
+      -- pills in both Quick Shares, for one - reported as a missing control on
+      -- a stack where it exists.
+      --
+      -- AND IMAGES (2026-08-31), for the same reason one step further out. A
+      -- demo may build a control the KIT does not: coinxt's wallet paints a
+      -- QR into an image, which is the only way a BMP this family builds
+      -- becomes something a phone can read. Registered and built, it reported
+      -- as missing - found by coinxt/tools/check-wallet-boot.py, which boots
+      -- the stack headlessly, so this one cost no engine time. The lesson is
+      -- the one this block already carries twice: the list of types a demo
+      -- can build is not the list of types the KIT builds.
+      --
+      -- AND EVERY CARD (2026-08-29). Unqualified `there is a field X` answers
+      -- for the CURRENT card only (engine notes 5.6) - OBSERVED when
+      -- riptide's five-card boot reported all 63 off-card controls missing
+      -- from a stack where every one existed. A single-card demo walks its
+      -- one card here, exactly the old behaviour.
+      put false into tFound
+      repeat with tC = 1 to the number of cards of this stack
+         if there is a field tName of card tC \
+               or there is a button tName of card tC \
+               or there is a graphic tName of card tC \
+               or there is an image tName of card tC then
+            put true into tFound
+            exit repeat
+         end if
+      end repeat
+      if not tFound then
+         put tName & comma after tMissing
+      end if
+   end repeat
+   if tMissing is empty then
+      return empty
+   end if
+   return char 1 to -2 of tMissing
+end scMissing
+
+-- Call LAST in <pfx>ScRun. It arms the probe below; 400ms lands it before the
+-- usual 800ms dashboard tick, so nothing races for the status line.
+--
+-- SAY THAT THE REPORT IS UNFINISHED, for the reason the suite harness carries a
+-- RUN NOT FINISHED trailer: a report that simply stops reads exactly like a
+-- report that ended, and the difference cost that harness a round trip on
+-- 2026-08-19. One line is cheaper than the ambiguity.
+command scArmProbe
+   scLine "      ...one delayed-write check still to come; the count line " \
+         & "below it is the end of the block"
+   send "scTickProbe" to me in 400 milliseconds
+end scArmProbe
+
+-- THE ONE CHECK THAT NEEDS A TIMER.
+--
+-- OXT-ENGINE-NOTES 5.3 says an unqualified control reference inside a delayed
+-- handler resolves against THE DEFAULTSTACK, not the stack whose script is
+-- running - and that entry is classed DOCUMENTED, not OBSERVED, because this
+-- tree has never actually watched the unpinned form fail. It also names the run
+-- that would settle it: open a second stack in front and let a `send ... in`
+-- handler write an unqualified field.
+--
+-- So this probe READS the defaultStack before pinning and PRINTS what it found.
+-- On an ordinary run that line is context. On a run with another window in front
+-- it is the measurement 5.3 is missing, taken for free and at no risk, because
+-- the pin lands immediately afterwards and the write is verified.
+command scTickProbe
+   local tWas, tPrev, tPrevColor, tGot, tErr
+   put the defaultStack into tWas
+   set the defaultStack to the short name of this stack
+   if there is no field "uiStatus" then
+      scSkip "a delayed handler writes the status line", "the chrome is not built"
+      scFinish
+      exit scTickProbe
+   end if
+   -- RESTORE THE COLOUR TOO, not just the text. uiStatus takes a KIND, and
+   -- handing it back "ok" would repaint a "bad" line green - so a stack whose
+   -- extension is missing would end this probe claiming to be fine.
+   put field "uiStatus" into tPrev
+   put the foregroundColor of field "uiStatus" into tPrevColor
+   try
+      uiStatus kScProbe, empty
+      put field "uiStatus" into tGot
+   catch tErr
+      put "THREW:" && tErr into tGot
+   end try
+   uiStatus tPrev, empty
+   set the foregroundColor of field "uiStatus" to tPrevColor
+   scAssert "a delayed handler writes the status line " \
+         & "(defaultStack on entry: " & scShow(tWas) & ")", (tGot is kScProbe)
+   scFinish
+end scTickProbe
+
+command scFinish
+   scLine "      " & sScPassed & " passed, " & sScFailed & " failed, " \
+         & sScSkipped & " skipped - select this block and copy it into the " \
+         & "OXT pass record"
+   if sScFailed is 0 then
+      scLine "      boot self-check GREEN (this is the single-machine claim; " \
+            & "the live legs are the runbook's)"
+      exit scFinish
+   end if
+   scLine "      boot self-check has FAILURES above - report them before " \
+         & "running any live leg"
+   -- ONLY ON FAILURE does this touch the status line, and the asymmetry is
+   -- deliberate. Green, the demo's own "Ready ..." line is the more useful
+   -- thing to be reading and the detail is in the log a few lines up. Red, the
+   -- log may be on a tab nobody has clicked - so the one surface a person is
+   -- certainly looking at has to say so. Fail loud, pass quiet.
+   uiStatus "Boot self-check: " & sScFailed & " FAILED (see the log)", "bad"
+end scFinish
+-- ==== DEMO SELF-CHECK v1 END ====
+
+-- Every control this script names, derived from the source by
+-- tools/check-demo-control-lists.py. Never hand-edited.
+constant kMdScControls = "mdAuto,mdBrokerPanel,mdClient,mdClientCap,mdConnPill,mdConnect,mdDisconnect,mdHost,mdHostCap,mdLog,mdLogCap,mdLogPanel,mdMessages,mdMsgCap,mdPass,mdPassCap,mdPort,mdPortCap,mdPubMsg,mdPubMsgCap,mdPubPanel,mdPubQoS,mdPubQoSCap,mdPubRetain,mdPubTopic,mdPubTopicCap,mdPublish,mdQoS,mdQoSCap,mdSecBroker,mdSecLog,mdSecPub,mdSecSub,mdSelfTest,mdStats,mdSubPanel,mdSubs,mdSubsCap,mdSubscribe,mdTLS,mdTopic,mdTopicCap,mdUnsubscribe,mdUser,mdUserCap,mdVerify,uiFooter,uiStatus,uiTitle"
+
+-- THE BOOT SELF-CHECK. Nothing below connects, binds, or publishes: the
+-- operator is about to press Connect for real, and a check that took the
+-- socket would be indistinguishable from a broker that refused it.
+command mdScRun
+   local tMissing, tVer, tReport, tConns, tRc, tThresh
+   scBegin "mdLog"
+
+   put scMissing(kMdScControls) into tMissing
+   scAssert "all 49 controls this script names exist (missing: " \
+         & scShow(tMissing) & ")", (tMissing is empty)
+
+   -- The library is EMBEDDED, so "is it installed?" is not the question -
+   -- "did the embed carry a working copy, and did preOpenStack initialise
+   -- it?" is. Both are answered here, because a stale or uninitialised embed
+   -- is exactly what this demo's one-file convention risks.
+   put mqttTestLibrary() into tVer
+   scAssert "the embedded libMQTTxt answers (" & scShow(tVer) & ")", \
+         (tVer contains "MQTT Library")
+
+   put mqttGetKeepAliveThreshold() into tThresh
+   scAssert "mqttInitialize ran: the keep-alive threshold is set (" \
+         & scShow(tThresh) & ")", \
+         (tThresh is a number and tThresh > 0 and tThresh <= 1)
+
+   -- The library's own pure-compute suite, run here so a stale embed cannot
+   -- pass unnoticed. It touches no socket.
+   put mqttSelfTest() into tReport
+   scAssert "the embedded library's own self-test passes", \
+         (tReport contains "All tests PASSED")
+
+   put mqttGetConnections() into tConns
+   scAssert "no connections at boot (" & scShow(tConns) & ")", (tConns is empty)
+   scAssert "no connection key held at boot (" & scShow(sConnKey) & ")", \
+         (sConnKey is empty)
+   scAssert "not connected at boot", (sConnected is not "true")
+   scAssert "the 1 Hz dashboard chain is armed", (sDashOn is "true")
+
+   -- Three refusals, each proving a guard fires BEFORE anything is opened.
+   -- Port 0 is invalid, so this returns without touching a socket.
+   put mqttConnect("example.invalid", 0, "sc", empty, empty, 60, false, true, \
+         empty, empty, 0, false, true, false, empty) into tRc
+   scAssert "an invalid port is refused before any socket opens (" \
+         & scShow(tRc) & ")", (tRc begins with "ERROR")
+
+   -- A bare IPv6 literal makes the "host:port" key ambiguous, so it is
+   -- refused rather than silently keyed wrong (OXT-ENGINE-NOTES 6.2).
+   put mqttConnect("::1", 1883, "sc", empty, empty, 60, false, true, \
+         empty, empty, 0, false, true, false, empty) into tRc
+   scAssert "an unbracketed IPv6 host is refused (" & scShow(tRc) & ")", \
+         (tRc begins with "ERROR")
+
+   put mqttPublish("example.invalid", 1883, "t", "m", 0, false) into tRc
+   scAssert "publishing while disconnected is refused (" & scShow(tRc) & ")", \
+         (tRc begins with "ERROR")
+
+   -- And nothing above left a socket behind.
+   scAssert "no socket was opened by this check", \
+         (mqttGetConnections() is empty)
+
+   scArmProbe
+end mdScRun

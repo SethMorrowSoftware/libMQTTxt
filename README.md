@@ -22,17 +22,47 @@ A pure OXT implementation of MQTT 3.1.1 protocol client with full QoS support, T
 - OXT or LCC 9.6.3
 - Network access to MQTT broker
 
+## Try it first
+
+`examples/mqtt-dashboard.livecodescript` is the demo: connect to a broker,
+subscribe, publish, and watch the traffic. **It is one file.** Paste it into a
+stack script and reopen the stack — the library is embedded in it, so there is
+nothing else to load and no wiring step.
+
+It prints its own boot record, too: on open it runs a non-destructive
+self-check (nothing is connected, bound, or published) and logs `PASS`/`FAIL`
+per assertion with a count line. That block is what an engine pass quotes,
+instead of "the window built and it looked right".
+
 ## Installation
 
-1. Download the `libMQTTxt.oxtstack` file
-2. Place in your OXT project directory
-3. Load the library in your stack:
+There are two ways to take the library, and they differ in exactly one line.
+
+**As a library stack** — the right dependency for a real project:
 
 ```OXT
 on preOpenStack
    start using stack "libMQTTxt.oxtstack"
 end preOpenStack
 ```
+
+**Embedded in your own stack script** — copy `libMQTTxt.oxtstack`'s contents
+above your own code (this is what the demo does, and what
+`tools/sync-demo-embeds.py` automates):
+
+```OXT
+on preOpenStack
+   -- The engine sends `libraryStack` only to a stack in stacksInUse, so an
+   -- embedded copy never receives it and its globals stay uninitialised.
+   -- This is the one line an embedding stack owes the library.
+   mqttInitialize
+end preOpenStack
+```
+
+Embedding also means you inherit the library's `on socketClosed` /
+`on socketError` / `on socketTimeout`. If your stack runs sockets of its own
+and needs to define those three itself, see
+[Co-existing with other socket libraries](#co-existing-with-other-socket-libraries).
 
 ## Quick Start
 
@@ -63,7 +93,9 @@ end onMessage
 ## Documentation
 
 - **[Complete API Reference](libMQTTxt_Reference.md)** - Full function documentation with examples
+- **[The demo](examples/mqtt-dashboard.livecodescript)** - one paste-and-run file; the shortest path to seeing the library work
 - **Built-in Self-Test** - Call `mqttSelfTest()` to verify the library's internal encoders and helpers
+- **[tools/VENDORED.md](tools/VENDORED.md)** - what this repo carries from [xtalk-suite](https://github.com/SethMorrowSoftware/xtalk-suite), and how to re-sync it
 
 ## Usage Examples
 
@@ -280,43 +312,71 @@ end if
 
 ### Static gates (run in CI, no engine required)
 
-OXT has no headless way to compile or run a `.oxtstack`, so the checks that CI
-*can* run stand in for the compiler it cannot. All three run from the repository
-root and need nothing but Python 3:
+OXT has no headless way to compile or run a `.oxtstack` or a
+`.livecodescript`, so the checks that CI *can* run stand in for the compiler it
+cannot. One command runs them all, in the order that makes each one's result
+mean something:
 
 ```sh
-python3 tools/check-libmqttxt.py        # the gate
-python3 tools/test-check-libmqttxt.py   # proves the gate still discriminates
-python3 tools/test-mqtt-vectors.py      # proves the framing against MQTT 3.1.1
+tools/run-gates.sh
 ```
 
-`check-libmqttxt.py` refuses pure-ASCII violations, `does not contain` and its
-relatives, undeclared `catch` variables, calls to helpers that do not exist,
-character-counting in binary framing, a missing or swallowed engine socket
-message, an unrouted timer handler, and a per-byte socket read. **Every rule is
-a defect this library actually shipped**, written down so it cannot ship twice.
+Nothing but Python 3 is needed. Individually:
 
-`test-check-libmqttxt.py` matters as much as the gate does: a gate that has gone
-blind reports OK, and OK is what a blind gate and a clean tree look like from
-the outside. It reintroduces each defect into a real copy of the library and
-fails if the gate does not fire, so an `OK` above means something.
+| Gate | What it holds |
+|------|---------------|
+| `test-check-libmqttxt.py` | that the library gate still fires on each defect |
+| `test-demo-gates.py` | that the five demo gates still fire on each defect |
+| `check-libmqttxt.py` | ASCII purity, `does not contain` and relatives, undeclared `catch` variables, calls to helpers that do not exist, character-counting in binary framing, a missing or swallowed engine socket message, an unrouted timer handler, a per-byte socket read, and any control reference in a headless library |
+| `test-mqtt-vectors.py` | the framing, against MQTT 3.1.1 byte sequences |
+| `sync-demo-embeds.py --check` | the demo's embedded library copy is current, and collides with nothing |
+| `check-carried-blocks.py` | the UI kit and boot self-check are byte-identical to their masters, adopted deliberately, and actually run |
+| `check-demo-control-lists.py` | the self-check's control list is re-derived from the demo's own source |
+| `check-demo-layout.py` | the window fits 720p and every control fits the window, its panel, and no neighbour |
+| `check-timer-stack-pin.py` | every `send … in` handler pins the defaultStack before touching a control |
 
-`test-mqtt-vectors.py` transliterates the framing into Python, checks it against
-byte sequences taken from MQTT 3.1.1 rather than from this library, and then
-diffs the transliteration against the real source - so a change the vectors do
-not follow is a failure rather than a stale pass.
+**Every rule is a defect that actually shipped**, here or in the suite this
+tooling comes from, written down so it cannot ship twice.
+
+The two `test-*` entries matter as much as the gates do, which is why they run
+first: **a gate that has gone blind reports OK, and OK is exactly what a blind
+gate and a clean tree look like from the outside.** They reintroduce each defect
+into a real copy of the tree and fail if the gate stays quiet, so the OKs
+underneath are worth reading.
+
+Two of those gates exist because their failures are *invisible without an
+engine*, not merely tedious to check: a control pushed past the bottom edge is
+simply not there, and an unpinned delayed write lands on the wrong stack or
+nowhere at all. Neither says anything at runtime.
 
 ### On-engine testing
 
-`mqttSelfTest()` runs the pure-compute checks inside the engine and returns a
-report; a failing run now lists which assertions failed, not just how many.
-Anything involving a live broker - QoS flows, TLS, reconnect, wildcards, large
-payloads - needs a real engine and a real broker.
+Open `examples/mqtt-dashboard.livecodescript`. It runs a **boot self-check** on
+open — 12 assertions, none of which connects, binds, or publishes — and prints
+`PASS`/`FAIL` per line with a count trailer into its own log. Select that block
+and paste it into the pass record: it is the citable half of an engine session,
+and it exists because the alternative is a human judgement ("the window built,
+it looked right") that no honesty label can quote.
+
+The check is deliberately non-destructive. Three of its assertions prove a
+*refusal* — an invalid port, an unbracketed IPv6 host, publishing while
+disconnected — because a check that took a socket would be indistinguishable
+from a broker that refused it, and the operator is about to press Connect for
+real.
+
+`mqttSelfTest()` runs the library's pure-compute checks inside the engine and
+returns a report; a failing run lists which assertions failed, not just how
+many. The demo's Self-test button runs it and logs the result.
+
+Anything involving a live broker — QoS flows, TLS, reconnect, wildcards, large
+payloads — needs a real engine and a real broker.
 
 **Honesty note:** everything in 2.12.0 is *verified statically; needs an OXT
-pass.* The static gates and the protocol vectors above are green, but no line of
-2.12.0 has been observed on a running engine against a live broker. The
-performance figures below are from 2.11.x and have not been re-measured.
+pass.* The gates and protocol vectors above are green, but no line of 2.12.0 —
+library or demo — has been observed on a running engine against a live broker.
+That includes the demo's window: no gate here can prove a stack BUILDS, only
+that its geometry is sound and its script is well-formed. The performance
+figures below are from 2.11.x and have not been re-measured.
 
 ## Performance
 
@@ -470,8 +530,31 @@ existing code can notice; they are listed first and deliberately.
 - `__scheduleMessage` diffed the pending-message list as one growing string,
   re-scanned per pending message; it uses an array now.
 
-**Tooling** - `tools/` now carries the static gates described under
-[Testing](#testing).
+**The demo, and one library change it forced**
+
+- `examples/mqtt-dashboard.livecodescript`: connect, subscribe, publish, watch
+  the traffic. One paste-and-run file, on the xTalk suite's UI kit, carrying
+  the suite's boot self-check.
+- **`mqttInitialize` is new, and embedding is why.** The engine sends
+  `libraryStack` only to a stack in stacksInUse, so a copy embedded in an
+  application's own stack script never received it: every global stayed empty
+  and the first connection ran against an uninitialised buffer limit and
+  keep-alive threshold. Initialisation is now a public command an embedding
+  stack calls from `preOpenStack`; `libraryStack` calls it too, so the
+  library-stack path is unchanged. The `stacksInUse` warning moved to that path
+  alone — it asks "did you forget `start using`?", which is nonsense for an
+  embedded copy where the answer is always no and the setup is nonetheless
+  correct.
+
+**Tooling** — `tools/` carries the static gates described under
+[Testing](#testing), and `tools/run-gates.sh` runs them all. Two of them —
+layout and timer-pinning — guard failures that are *invisible without an
+engine*: a control past the bottom edge is simply not there, and an unpinned
+delayed write lands on the wrong stack or nowhere. The UI kit and boot
+self-check are vendored from
+[xtalk-suite](https://github.com/SethMorrowSoftware/xtalk-suite); see
+[tools/VENDORED.md](tools/VENDORED.md) for what that coupling is and, more to
+the point, what it is not.
 
 ### 2.11.9
 - Critical fix: removed leftover debug `answer` dialogs from `mqttSetCallbackTarget`
