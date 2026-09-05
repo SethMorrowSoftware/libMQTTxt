@@ -45,8 +45,17 @@ a socket the engine still lists in `the openSockets`.
 
 **Gate:** `tools/check-libmqttxt.py` refuses a bare `write ... to socket`;
 everything routes through `__writeSocket`, which checks the throw AND `the
-result`. The ceiling itself is not yet measured - the conformance button's size
-ladder (4 KB / 16 KB / 64 KB / 128 KB / 200 KB) is there to find it.
+result`.
+
+**Second run, 2026-09-05, against broker.hivemq.com with the check in place:**
+the size ladder round-tripped 4 KB, 16 KB, 64 KB, 128 KB and 204800 bytes
+intact, QoS 1, each PUBACKed. So a 200 KB write completes on this engine
+against THAT broker. **That does not close the original failure**, which was
+against the local mosquitto at 192.168.1.104 - a different broker, not yet
+re-run with the fix. Until it is, the mosquitto result stands as an
+unexplained failure with a plausible cause, not a fixed one. If the re-run
+fails again with `__writeSocket` reporting nothing, the cause is not a partial
+write and this entry is wrong about it.
 
 ### 1.2 `secure socket ... with verification` reports success on a plaintext port
 **OBSERVED 2026-09-05.** `secure socket` was applied to a connection on port
@@ -64,6 +73,26 @@ was the only signal that the connection was not usable.
 **Not yet closed.** The library still reports what the engine tells it. Until
 this is understood, treat TLS status as unverified regardless of what the log
 says, and confirm a TLS connection reached CONNACK before trusting it.
+
+### 1.3 At QoS 2, the echo arrives before our own handshake completes
+**OBSERVED 2026-09-05**, against broker.hivemq.com.
+
+Publishing at QoS 2 to a topic we are subscribed to puts TWO exchanges in flight
+with independent packet IDs: ours (`PUBLISH 3 -> PUBREC 3 -> PUBREL 3 ->
+PUBCOMP 3`, which clears the pendingAcks entry) and the broker's delivery back
+to us (`PUBLISH 101 -> PUBREC 101 -> PUBREL 101`, which hands the message to
+the callback). The log shows the order they actually interleaved:
+
+    PUBREC received for packet 3
+    PUBREL received for packet 101        <- our message is delivered HERE
+    FAIL  the QoS 2 acknowledgment leg    <- checked pendingAcks at this instant
+    PUBCOMP received for packet 3         <- and it drained one line later
+
+**What it broke:** the conformance run asserted, at the moment of delivery,
+that our acknowledgment leg had drained - and reported a correct library as
+leaving an ack outstanding. **Gate:** none needed in the library, which is
+right; the conformance stage now polls pendingAcks with a deadline instead of
+asserting it on delivery.
 
 ---
 
@@ -85,19 +114,38 @@ says, and confirm a TLS connection reached CONNACK before trusting it.
   delivered exactly once
 - unsubscribe removes the filter from the table
 
-**Not established, and the run said otherwise:**
+**Not established by the FIRST run, and it said otherwise:**
 
 - **keep-alive.** The hold stage passed, and should not have. The library pings
   at 45s idle and only gives up 90s after the PINGREQ, so across a 100s hold a
   connection whose PINGRESP never came back is still marked connected. With the
   inbound path already dead from 1.1, that PASS proved nothing. The stage now
-  requires `lastPingTime` to be 0 - the value `__parsePingResp` zeroes - so a
-  ping that went unanswered fails instead.
+  requires `lastPingTime` to be 0 - the value `__parsePingResp` zeroes.
 - **"nothing is delivered after unsubscribing."** Vacuous in that run: nothing
-  was being delivered at all. The conformance run now prints a notice after its
-  first failure saying every later result, PASS included, needs that failure
-  fixed before it means anything.
+  was being delivered at all.
 
-**Untested:** auto-reconnect after a broker restart, multi-connection (needs two
-addresses - the library keys connections by `host:port`), persistent store, and
-TLS end to end.
+### Second run, 2026-09-05, OXT + broker.hivemq.com (v2.12.1)
+
+13 passed, 1 failed, 1 skipped - and the one failure was the test's (1.3), not
+the library's.
+
+**Newly OBSERVED:**
+
+- **keep-alive, properly this time.** 100s idle, `mqttIsConnected` still true
+  AND `lastPingTime` back to 0: a PINGREQ went out at the threshold, a PINGRESP
+  came back, `__parsePingResp` processed it, and the timer rescheduled. The
+  token-routed timer chain works for one connection.
+- **large payloads to 204800 bytes** round-trip intact and PUBACKed, on this
+  broker - see 1.1 for why that does not yet close the mosquitto failure.
+- **retained messages**: published with the flag, delivered live, then replayed
+  to a fresh subscription after an unsubscribe/resubscribe, then cleared with a
+  zero-length retained publish - which was itself delivered live as a 0-byte
+  message, so **zero-length payloads frame correctly** too.
+- **unsubscribe**, with UNSUBACK confirmed and nothing delivered afterwards -
+  meaningful this time, because the inbound path was live throughout.
+- **QoS 2 exactly-once**: delivered 1x, and the outbound handshake completed
+  (PUBCOMP arrived; the test simply checked too early).
+
+**Still untested:** the mosquitto 200 KB re-run (1.1); multi-connection (needs
+`kCtHost2` set - the library keys connections by `host:port`); auto-reconnect
+after a broker restart; persistent store; TLS end to end (1.2).
