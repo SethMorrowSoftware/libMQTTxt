@@ -1,6 +1,10 @@
 # MQTT Client Library Reference
 
-Version 2.11.9 - OXT MQTT 3.1.1 Implementation
+Version 2.12.0 - OXT MQTT 3.1.1 Implementation
+
+> **Status: verified statically; needs an OXT pass.** The static gates under
+> `tools/` and the MQTT 3.1.1 protocol vectors are green, but no line of 2.12.0
+> has been observed on a running engine against a live broker.
 
 ## Table of Contents
 
@@ -265,29 +269,52 @@ function mqttConnect(pHost, pPort, pClientID, pUsername, pPassword, \
 ```
 
 **Parameters:**
-- `pHost` - Broker hostname or IP
-- `pPort` - Broker port (usually 1883 or 8883 for TLS)
-- `pClientID` - Unique client identifier
+- `pHost` - Broker hostname or IP. Required. An IPv6 literal must be bracketed
+  (`[::1]`), because the connection key is `host:port` and a bare IPv6 address
+  makes that ambiguous.
+- `pPort` - Broker port, 1-65535 (usually 1883, or 8883 for TLS)
+- `pClientID` - Unique client identifier (max 65535 bytes; defaults to a
+  generated `LC_<milliseconds>`)
 - `pUsername` - Username (empty string if none)
-- `pPassword` - Password (empty string if none)
-- `pKeepAlive` - Keep-alive interval in seconds (default 60)
+- `pPassword` - Password (empty string if none). **Ignored without a username**:
+  MQTT 3.1.1 section 3.1.2.9 does not allow a password flag without a user name
+  flag, and a broker may close the connection on one.
+- `pKeepAlive` - Keep-alive interval in seconds, 0-65535 (default 60). `0`
+  disables keep-alive entirely, per the spec: no PINGREQ is sent and no timer
+  runs.
 - `pUseTLS` - Boolean, enable TLS encryption (default false)
 - `pCleanSession` - Boolean, start clean session (default true)
-- `pLWTTopic` - Last Will Testament topic (empty if none)
-- `pLWTMessage` - Last Will Testament message
+- `pLWTTopic` - Last Will Testament topic (empty if none; max 65535 bytes)
+- `pLWTMessage` - Last Will Testament message (max 65535 bytes)
 - `pLWTQoS` - Last Will Testament QoS (0, 1, or 2)
 - `pLWTRetain` - Last Will Testament retain flag
-- `pVerifyTLS` - Boolean, verify TLS certificates (default false)
+- `pVerifyTLS` - Boolean, verify TLS certificates. **Default true as of
+  2.12.0** (it was false). Pass `false` only deliberately; doing so logs a
+  warning, because an unverified TLS socket is encrypted against a passive
+  listener and worthless against an active one.
 - `pAutoReconnect` - Boolean, enable automatic reconnection (default false)
-- `pCACertPath` - Path to CA certificate file
+- `pCACertPath` - Path to a CA certificate file, for a broker whose certificate
+  chains to a private or self-signed authority
 
 **Returns:** "OK" on success, "ERROR: message" on failure
+
+**"OK" means the socket open was initiated, not that the broker accepted the
+connection.** Wait for the state-change callback's `connected` event (or poll
+`mqttIsConnected`) before publishing.
+
+**Auto-reconnect does not retry a rejection.** CONNACK codes 2 (identifier
+rejected) and 3 (server unavailable) are retried with exponential back-off;
+codes 1, 4 and 5 (bad protocol version, bad credentials, not authorized) are the
+broker refusing *this* CONNECT, so retrying re-presents the same rejected packet
+forever - which for a bad password is an automated lockout against the user's
+own account. Those disable auto-reconnect and report through the state-change
+callback.
 
 **Example:**
 ```OXT
 put mqttConnect("broker.example.com", 8883, "client123", \
                 "user", "pass", 60, true, true, "", "", \
-                0, false, false, true, "") into tResult
+                0, false, true, true, "") into tResult
 
 if tResult is "OK" then
    -- Connection initiated
@@ -674,7 +701,7 @@ function mqttTestLibrary()
 **Example:**
 ```OXT
 put mqttTestLibrary()
--- Returns: "MQTT Library v2.11.9 loaded successfully (Test Suite 100% Compliance)"
+-- Returns: "MQTT Library v2.12.0 loaded successfully"
 ```
 
 ---
@@ -866,7 +893,7 @@ on mouseUp
    
    -- Connect to broker
    put mqttConnect("broker.hivemq.com", 1883, "myClient", "", "", \
-                   60, false, true, "", "", 0, false, false, false, "") into tResult
+                   60, false, true, "", "", 0, false, true, false, "") into tResult
    
    if tResult is not "OK" then
       answer "Connection failed:" && tResult
@@ -904,7 +931,7 @@ on connectSecure
    -- Connect with TLS
    put mqttConnect("secure.broker.com", 8883, "secureClient", \
                    "username", "password", 60, true, true, \
-                   "", "", 0, false, false, false, "") into tResult
+                   "", "", 0, false, true, false, "") into tResult
    
    if tResult is "OK" then
       put "Connecting..." into field "Status"
@@ -954,7 +981,7 @@ on connectWithAutoReconnect
    -- Enable auto-reconnect
    put mqttConnect("broker.example.com", 1883, "resilientClient", \
                    "user", "pass", 60, false, true, "", "", \
-                   0, false, false, true, "") into tResult
+                   0, false, true, true, "") into tResult
    
    -- Auto-reconnect is now enabled
    -- Library will automatically reconnect on connection loss
@@ -985,7 +1012,7 @@ on connectWithLWT
    put mqttConnect("broker.example.com", 1883, "device123", \
                    "", "", 60, false, true, \
                    "device/123/status", "offline", 1, true, \
-                   false, false, "") into tResult
+                   true, false, "") into tResult
    
    -- If this client disconnects abnormally, 
    -- broker will publish "offline" to "device/123/status" with QoS 1, retained
@@ -1062,12 +1089,12 @@ on setupMultipleConnections
    -- Connect to first broker
    put mqttConnect("broker1.example.com", 1883, "client1", \
                    "", "", 60, false, true, "", "", \
-                   0, false, false, false, "") into tResult1
+                   0, false, true, false, "") into tResult1
    
    -- Connect to second broker
    put mqttConnect("broker2.example.com", 1883, "client2", \
                    "", "", 60, false, true, "", "", \
-                   0, false, false, false, "") into tResult2
+                   0, false, true, false, "") into tResult2
    
    -- Each connection is identified by host:port combination
    -- Can publish/subscribe to either broker independently
@@ -1122,7 +1149,7 @@ on connectToBroker
    
    put mqttConnect(sHost, sPort, "OXTClient", "", "", \
                    60, false, true, "", "", 0, false, \
-                   false, false, "") into tResult
+                   true, false, "") into tResult
    
    if tResult is not "OK" then
       answer error "Connection failed:" && tResult
