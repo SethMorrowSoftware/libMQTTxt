@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""Static gate for libMQTTxt.oxtstack.
+
+OXT has no headless way to compile or run a `.livecodescript` / `.oxtstack`, so
+every rule here is a stand-in for a compiler that cannot be run in CI. Each one
+is a defect that actually shipped in this library, written down so it cannot
+ship twice.
+
+Run with no arguments from anywhere in the repo; exits non-zero on any finding.
+"""
+
+import os
+import re
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+TARGET = os.path.join(ROOT, "libMQTTxt.oxtstack")
+
+# ---------------------------------------------------------------------------
+# Source scanning
+# ---------------------------------------------------------------------------
+
+HANDLER_RE = re.compile(
+    r"^\s*(private\s+)?(on|command|function)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(.*)$"
+)
+
+# `end if`, `end try`, `end repeat` and `end switch` close a BLOCK, not a
+# handler. Matching them as handler ends is the defect this gate's own first run
+# reported against itself: every scan below stopped at the first `end if` and
+# read the rest of the handler as though it were top level.
+BLOCK_ENDS = {"if", "try", "repeat", "switch"}
+_END_RE = re.compile(r"^\s*end\s+([A-Za-z_][A-Za-z0-9_]*)\s*$")
+
+
+def handler_end(stripped):
+    """True when this line ends a HANDLER (not a block)."""
+    m = _END_RE.match(stripped)
+    return bool(m) and m.group(1) not in BLOCK_ENDS
+
+
+def strip_noise(line):
+    """Blank out comments and string literals, tracking string state.
+
+    The usual noise-stripper blanks literals only; here the literals matter as
+    little as the comments, but a `--` INSIDE a literal must not start one.
+    """
+    out = []
+    in_str = False
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if in_str:
+            out.append(" ")
+            if c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+            out.append(" ")
+        elif c == "-" and line[i : i + 2] == "--":
+            out.append(" " * (len(line) - i))
+            break
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def load(path):
+    with open(path, encoding="utf-8") as fh:
+        return fh.read().split("\n")
+
+
+def handlers(lines):
+    """Map handler name -> (kind, parameter count, line number)."""
+    found = {}
+    for n, raw in enumerate(lines, 1):
+        stripped = strip_noise(raw)
+        m = HANDLER_RE.match(stripped)
+        if not m:
+            continue
+        kind, name, params = m.group(2), m.group(3), m.group(4).strip()
+        count = len([p for p in params.split(",") if p.strip()]) if params else 0
+        found[name] = (kind, count, n)
+    return found
+
+
+# ---------------------------------------------------------------------------
+# Checks
+# ---------------------------------------------------------------------------
+
+def check_calls(lines, defined, problems):
+    """Every private helper called must exist.
+
+    A misspelled or renamed `__helper` does not fail to compile - xTalk reads an
+    unknown bare word as a message send that finds no handler at RUNTIME, on
+    whatever path happens to reach it first.
+    """
+    known = set(defined)
+    call_re = re.compile(r"\b(__[A-Za-z0-9_]+)\b")
+    for n, raw in enumerate(lines, 1):
+        for name in call_re.findall(strip_noise(raw)):
+            if name.startswith("__") and name not in known:
+                problems.append(
+                    "%d: calls `%s`, which no handler in this file defines" % (n, name)
+                )
+
+
+def check_binary_semantics(lines, problems):
+    """Binary framing must count BYTES, not characters.
+
+    `char`, `charToNum` and `the length of` count characters; a UTF-8 payload
+    makes them disagree with the byte count the protocol declares, and every
+    packet after the first multi-byte one is misframed. Handlers that only
+    touch text (filenames, log lines) are exempt by name.
+    """
+    text_only = {"__sanitizeFilename", "__scheduleMessage", "mqttSelfTest",
+                 "__decodeRemainingLength"}
+    current = None
+    for n, raw in enumerate(lines, 1):
+        stripped = strip_noise(raw)
+        m = HANDLER_RE.match(stripped)
+        if m:
+            current = m.group(3)
+            continue
+        if handler_end(stripped):
+            current = None
+            continue
+        if current in text_only:
+            continue
+        for token, why in (
+            (r"\bcharToNum\s*\(", "charToNum"),
+            (r"\bthe length of\b", "the length of"),
+            (r"\blength\s*\(", "length()"),
+        ):
+            if re.search(token, stripped):
+                problems.append(
+                    "%d: `%s` in `%s` counts CHARACTERS; binary framing needs "
+                    "`the number of bytes of` / `byteToNum`" % (n, why, current)
+                )
+
+
+def check_engine_socket_messages(defined, problems):
+    """The engine's three socket messages must be declared, and split.
+
+    socketClosed / socketError / socketTimeout are the ONLY names the engine
+    sends when a socket drops, fails or idles. This library once declared
+    `mqttSocketClosed` instead and nothing ever sent it, so a dropped
+    connection fired no callback and auto-reconnect was unreachable code.
+
+    They are also required to be thin wrappers over same-named functions, so an
+    app that runs its own sockets can drop the wrappers and call the functions -
+    two scripts cannot define one of these names in one script.
+    """
+    for msg in ("socketClosed", "socketError", "socketTimeout"):
+        if msg not in defined:
+            problems.append(
+                "the engine message `%s` is not declared; a dropped socket "
+                "will go unnoticed" % msg
+            )
+            continue
+        if defined[msg][0] != "on":
+            problems.append("`%s` must be an `on` handler" % msg)
+
+        logic = "mqttS" + msg[1:]
+        if logic not in defined:
+            problems.append(
+                "`%s` has no `%s` function to dispatch to; keep the logic "
+                "behind a name of its own so an embedder can drop the wrapper"
+                % (msg, logic)
+            )
+        elif defined[logic][0] != "function":
+            problems.append("`%s` must be a function returning ours/not-ours" % logic)
+
+
+def check_engine_messages_pass(lines, problems):
+    """A socket message that is not ours must be PASSED, never swallowed.
+
+    Eating another library's socketClosed is a silent hang for that library, and
+    silent is the worst failure this project has.
+    """
+    for msg in ("socketClosed", "socketError", "socketTimeout"):
+        body, inside = [], False
+        for raw in lines:
+            stripped = strip_noise(raw)
+            m = HANDLER_RE.match(stripped)
+            if m and m.group(3) == msg:
+                inside = True
+                continue
+            if inside and handler_end(stripped):
+                break
+            if inside:
+                body.append(stripped)
+        if body and not any(re.search(r"\bpass\s+%s\b" % msg, b) for b in body):
+            problems.append(
+                "`on %s` never does `pass %s`; a message belonging to another "
+                "socket library would be swallowed" % (msg, msg)
+            )
+
+
+def check_timer_handlers_take_a_token(defined, problems):
+    """Timer handlers must be routed, not broadcast.
+
+    Both timer handlers once took no argument and scanned EVERY connection for a
+    marker equal to its own key. With two connections open, whichever timer
+    fired first serviced BOTH - so a connection was pinged on its neighbour's
+    schedule and dropped by the broker for being idle.
+    """
+    for name in ("__executeKeepAliveTimer", "__executeReconnectTimer"):
+        if name not in defined:
+            problems.append("timer handler `%s` is missing" % name)
+        elif defined[name][1] < 1:
+            problems.append(
+                "`%s` takes no parameter; a timer must name the ONE connection "
+                "it belongs to, not scan for it" % name
+            )
+        elif defined[name][0] != "on":
+            problems.append(
+                "`%s` must be an `on` handler to receive a sent message" % name
+            )
+
+
+def check_ascii(path, problems):
+    """OXT source in this family is pure ASCII, comments included."""
+    with open(path, "rb") as fh:
+        data = fh.read()
+    line = 1
+    for byte in data:
+        if byte == 0x0A:
+            line += 1
+        elif byte > 127:
+            problems.append("%d: non-ASCII byte 0x%02X; OXT source must be ASCII"
+                            % (line, byte))
+            break
+
+
+def check_bad_operators(lines, problems):
+    """`does not contain` / `does not begin with` are not xTalk.
+
+    The parser errors on `does`, and it takes the WHOLE script down, not just
+    the handler - which is how two of these made every public handler in this
+    library unreachable.
+    """
+    bad = re.compile(r"\bdoes\s+not\s+(contain|begin\s+with|end\s+with)\b")
+    for n, raw in enumerate(lines, 1):
+        if bad.search(strip_noise(raw)):
+            problems.append(
+                "%d: `does not ...` is not an xTalk operator; the parser errors "
+                "on `does` and the whole script fails to compile" % n
+            )
+
+
+def check_catch_variables_declared(lines, problems):
+    """Every `catch X` must have X declared in the same handler.
+
+    On strict OXT an undeclared catch variable throws a SECOND error when the
+    catch fires, which masks the failure you were trying to report.
+    """
+    current, declared, caught = None, set(), []
+    decl_re = re.compile(r"^\s*(?:local|global)\s+(.*)$")
+    catch_re = re.compile(r"^\s*catch\s+([A-Za-z_][A-Za-z0-9_]*)\s*$")
+
+    def flush():
+        for name, line in caught:
+            if name not in declared:
+                problems.append(
+                    "%d: catch variable `%s` in `%s` is never declared"
+                    % (line, name, current)
+                )
+
+    for n, raw in enumerate(lines, 1):
+        stripped = strip_noise(raw)
+        m = HANDLER_RE.match(stripped)
+        if m:
+            if current:
+                flush()
+            current = m.group(3)
+            params = m.group(4).strip()
+            declared = {p.strip() for p in params.split(",") if p.strip()}
+            caught = []
+            continue
+        if handler_end(stripped):
+            if current:
+                flush()
+            current, declared, caught = None, set(), []
+            continue
+        if current is None:
+            continue
+        d = decl_re.match(stripped)
+        if d:
+            declared.update(x.strip() for x in d.group(1).split(",") if x.strip())
+        c = catch_re.match(stripped)
+        if c:
+            caught.append((c.group(1), n))
+    if current:
+        flush()
+
+
+def check_per_byte_reads(lines, problems):
+    """`read ... for 1 ...` costs one engine message dispatch per byte.
+
+    The no-quantifier form streams whatever has arrived; the suite's onionxt
+    confirmed that on a real engine. `for 1` turned a 1 MB payload into a
+    million round trips through the message queue.
+    """
+    for n, raw in enumerate(lines, 1):
+        stripped = strip_noise(raw)
+        if re.search(r"\bread\s+from\s+socket\b.*\bfor\s+1\b", stripped):
+            problems.append(
+                "%d: `read from socket ... for 1` dispatches one message PER "
+                "BYTE; drop the quantifier to stream what has arrived" % n
+            )
+
+
+def main():
+    if not os.path.exists(TARGET):
+        print("check-libmqttxt: cannot find %s" % TARGET, file=sys.stderr)
+        return 2
+
+    lines = load(TARGET)
+    defined = handlers(lines)
+    problems = []
+
+    check_ascii(TARGET, problems)
+    check_bad_operators(lines, problems)
+    check_catch_variables_declared(lines, problems)
+    check_calls(lines, defined, problems)
+    check_binary_semantics(lines, problems)
+    check_engine_socket_messages(defined, problems)
+    check_engine_messages_pass(lines, problems)
+    check_timer_handlers_take_a_token(defined, problems)
+    check_per_byte_reads(lines, problems)
+
+    if problems:
+        for p in problems:
+            print("libMQTTxt.oxtstack:%s" % p)
+        print("\ncheck-libmqttxt: %d problem(s)" % len(problems), file=sys.stderr)
+        return 1
+
+    print("check-libmqttxt: OK (%d handlers checked)" % len(defined))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

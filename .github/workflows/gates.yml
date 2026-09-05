@@ -1,0 +1,51 @@
+# The compiler-free gates for libMQTTxt.
+#
+# WHY THIS FILE EXISTS: OXT has no headless way to compile or run a
+# `.oxtstack`, so nothing in CI can prove that this library LOADS. What CI can
+# prove is everything that is pure computation or pure structure, and that is
+# what runs here - each rule standing in for a compiler that cannot be run.
+#
+# Note the ORDER inside the job, which is the whole point of the middle step: a
+# gate that has gone blind reports OK, and OK is exactly what a blind gate and a
+# clean tree look like from the outside. test-check-libmqttxt.py reintroduces
+# each defect into a real copy of the library and fails if the gate stays quiet,
+# so it runs BEFORE the gate whose output it makes meaningful.
+name: gates
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: gates-${{ github.ref }}
+  cancel-in-progress: true
+
+# Nothing here writes anything; it reads the tree and exits.
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The discriminating test first: it is what makes the gate's OK mean
+      # something. If a rule has stopped firing, fail here rather than sail
+      # through a green gate that is no longer looking.
+      - name: gate still discriminates
+        run: python3 tools/test-check-libmqttxt.py
+
+      - name: static gate
+        run: python3 tools/check-libmqttxt.py
+
+      # The framing is pure computation, so it can be proved offline against
+      # MQTT 3.1.1 byte sequences rather than against this library's own output.
+      - name: MQTT 3.1.1 protocol vectors
+        run: python3 tools/test-mqtt-vectors.py
