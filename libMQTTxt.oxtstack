@@ -578,7 +578,7 @@ function mqttPublish pHost, pPort, pTopic, pMessage, pQoS, pRetain
       if tPacketID is not empty and tPacketID > 0 then
          delete variable gMQTTConnections[tConnID]["pendingAcks"][tPacketID]
       end if
-      return "ERROR:" && tError
+      return __failWrite(tConnID, "PUBLISH", tError)
    end if
 
    put the milliseconds into gMQTTConnections[tConnID]["lastActivity"]
@@ -649,7 +649,7 @@ function mqttSubscribe pHost, pPort, pTopic, pQoS
    local tError
    put __writeSocket(tConnID, tPacket) into tError
    if tError is not empty then
-      return "ERROR:" && tError
+      return __failWrite(tConnID, "SUBSCRIBE", tError)
    end if
 
    put the milliseconds into gMQTTConnections[tConnID]["lastActivity"]
@@ -698,7 +698,7 @@ function mqttUnsubscribe pHost, pPort, pTopic
    local tError
    put __writeSocket(tConnID, tPacket) into tError
    if tError is not empty then
-      return "ERROR:" && tError
+      return __failWrite(tConnID, "UNSUBSCRIBE", tError)
    end if
 
    put the milliseconds into gMQTTConnections[tConnID]["lastActivity"]
@@ -817,7 +817,7 @@ command mqttCleanupAll
 end mqttCleanupAll
 
 function mqttTestLibrary
-   return "MQTT Library v2.12.1 loaded successfully"
+   return "MQTT Library v2.12.2 loaded successfully"
 end mqttTestLibrary
 
 function mqttSelfTest
@@ -950,7 +950,7 @@ function mqttSelfTest
    -- Summary
    put "MQTT Library Self-Test" & return into tResults
    put "=====================" & return after tResults
-   put "Version: 2.12.1" & return after tResults
+   put "Version: 2.12.2" & return after tResults
    put "Passed:" && tPassed & return after tResults
    put "Failed:" && tFailed & return after tResults
 
@@ -1408,6 +1408,30 @@ private function __writeSocket pSocketID, pPacket
    end if
    return empty
 end __writeSocket
+
+-- A FAILED WRITE CORRUPTS THE STREAM, NOT JUST THE PACKET, so the only safe
+-- response is to reset the connection - which is what this does, and what
+-- the first version of the write check did not.
+--
+-- OBSERVED 2026-09-05, mosquitto on a LAN: a 131072-byte PUBLISH failed with
+-- "timeout". __writeSocket reported it - that half worked - but mqttPublish
+-- returned the error and left the connection up. From that instant the broker
+-- was holding a fixed header promising bytes that never came, so every later
+-- write (a PUBLISH, an UNSUBSCRIBE, a PINGREQ) was read as the missing tail
+-- of that one packet. Nothing was acknowledged, nothing was echoed, and the
+-- keep-alive would not have noticed for another ~135 seconds. A connection in
+-- that state is dead in one direction and looks alive in both.
+--
+-- We cannot tell a write that sent nothing from one that sent half; the safe
+-- assumption is half. Tearing down costs one reconnect. Not tearing down costs
+-- a silently dead connection. Returns the error text for the caller to pass up.
+private function __failWrite pConnID, pWhat, pError
+   __mqttLog "ERROR writing" && pWhat & ":" && pError && \
+         "- the stream may be corrupt; resetting the connection"
+   __cleanupConnection pConnID, pWhat && "write failed:" && pError
+   __handleReconnect pConnID
+   return "ERROR:" && pError && "(connection reset)"
+end __failWrite
 
 private command __closeSocketQuietly pSocketID
    -- Closing an already-closed socket is not an error worth propagating, but it
@@ -2283,7 +2307,10 @@ private command __resendPendingAcks pConnID
          if tError is empty then
             __mqttDebug "Resent (DUP) packet" && tPacketID
          else
-            __mqttLog "ERROR resending packet" && tPacketID & ":" && tError
+            -- The connection is reset by this call; every later write in this
+            -- loop would go to a closed socket, so stop here.
+            get __failWrite(pConnID, "PUBLISH (DUP " & tPacketID & ")", tError)
+            exit __resendPendingAcks
          end if
       end if
    end repeat
@@ -2834,7 +2861,7 @@ private command __sendPubRec pConnID, pPacketID
       if tError is empty then
          __mqttDebug "PUBREC sent for packet" && pPacketID
       else
-         __mqttLog "ERROR sending PUBREC:" && tError
+         get __failWrite(pConnID, "PUBREC", tError)
       end if
    end if
 end __sendPubRec
@@ -2853,7 +2880,7 @@ private command __sendPubRel pConnID, pPacketID
       if tError is empty then
          __mqttDebug "PUBREL sent for packet" && pPacketID
       else
-         __mqttLog "ERROR sending PUBREL:" && tError
+         get __failWrite(pConnID, "PUBREL", tError)
       end if
    end if
 end __sendPubRel
@@ -2872,7 +2899,7 @@ private command __sendPubComp pConnID, pPacketID
       if tError is empty then
          __mqttDebug "PUBCOMP sent for packet" && pPacketID
       else
-         __mqttLog "ERROR sending PUBCOMP:" && tError
+         get __failWrite(pConnID, "PUBCOMP", tError)
       end if
    end if
 end __sendPubComp
@@ -2891,7 +2918,7 @@ private command __sendPubAck pConnID, pPacketID
       if tError is empty then
          __mqttDebug "PUBACK sent for packet" && pPacketID
       else
-         __mqttLog "ERROR sending PUBACK:" && tError
+         get __failWrite(pConnID, "PUBACK", tError)
       end if
    end if
 end __sendPubAck

@@ -49,13 +49,48 @@ result`.
 
 **Second run, 2026-09-05, against broker.hivemq.com with the check in place:**
 the size ladder round-tripped 4 KB, 16 KB, 64 KB, 128 KB and 204800 bytes
-intact, QoS 1, each PUBACKed. So a 200 KB write completes on this engine
-against THAT broker. **That does not close the original failure**, which was
-against the local mosquitto at 192.168.1.104 - a different broker, not yet
-re-run with the fix. Until it is, the mosquitto result stands as an
-unexplained failure with a plausible cause, not a fixed one. If the re-run
-fails again with `__writeSocket` reporting nothing, the cause is not a partial
-write and this entry is wrong about it.
+intact, QoS 1, each PUBACKed. A 200 KB write completes on this engine against
+that broker over the internet.
+
+**Third run, same day, back against mosquitto at 192.168.1.104 - and this is
+the one that settles it.** 4 KB, 16 KB and 64 KB round-tripped intact. Then:
+
+    FAIL  large payload at 131072 bytes - ERROR: timeout
+
+That is not the test's deadline; it is the library REPORTING the write failure
+- the fix's first half, working. Everything after it confirms the mechanism
+predicted above: the next PUBLISH went out and never came back, the UNSUBSCRIBE
+logged no UNSUBACK, and the strengthened keep-alive check fired exactly as
+designed - `a PINGREQ went out and no PINGRESP came back (lastPingTime still
+1788649708812) - the link is dead inbound and only looks connected`. Diagnosis
+CONFIRMED.
+
+**Three things this run establishes:**
+
+1. **The ceiling is path-dependent, not a library constant.** Mosquitto over a
+   LAN: 65536 bytes passes, 131072 fails. hivemq over the internet: 204800
+   passes. Whatever bounds it, it is not the library's framing - the same bytes
+   go out either way.
+2. **The failure is a `timeout` from a synchronous write.** `write ... to
+   socket` without `with message` blocks until the data is written or `the
+   socketTimeoutInterval` elapses (engine default 10000 ms). Why a 128 KB LAN
+   write would take that long is NOT established - candidates are the
+   engine's own write path being throughput-bound, or the broker refusing the
+   size (mosquitto's `message_size_limit`) - and the conformance ladder now
+   times every rung so the next run discriminates them: writes that grow with
+   size and then hit the interval are the first; instant small rungs and one
+   outright refusal are the second.
+3. **Reporting the error was only half the fix.** The library returned `ERROR:
+   timeout` and left the connection up with a corrupt output stream, so every
+   later write was eaten as the tail of the broken packet. v2.12.2:
+   `__failWrite` resets the connection the instant any write fails - the same
+   response the PINGREQ path already had - and schedules a reconnect if one is
+   enabled. A caller now gets `ERROR: timeout (connection reset)` and a
+   `disconnected` state change, instead of a connection that answers nothing.
+
+**What to check on the mosquitto side** before reading the next run:
+`message_size_limit` in `mosquitto.conf` and `conf.d/`. If it sits between 64 KB
+and 128 KB, explanation 2 is the whole story.
 
 ### 1.2 `secure socket ... with verification` reports success on a plaintext port
 **OBSERVED 2026-09-05.** `secure socket` was applied to a connection on port
@@ -146,6 +181,15 @@ the library's.
 - **QoS 2 exactly-once**: delivered 1x, and the outbound handshake completed
   (PUBCOMP arrived; the test simply checked too early).
 
-**Still untested:** the mosquitto 200 KB re-run (1.1); multi-connection (needs
-`kCtHost2` set - the library keys connections by `host:port`); auto-reconnect
-after a broker restart; persistent store; TLS end to end (1.2).
+### Third run, 2026-09-05, OXT + mosquitto 192.168.1.104 (v2.12.1)
+
+11 passed, 3 failed, 1 skipped. Two of the three failures are the SAME failure
+seen through two instruments, and the third is its cascade - see 1.1. Nothing
+new failed in the library; what this run did was confirm the diagnosis and show
+that reporting a bad write is not the same as recovering from it.
+
+**Still untested:** the mosquitto ladder with v2.12.2 and the write timings
+(1.1); multi-connection (needs `kCtHost2` set - the library keys connections by
+`host:port`); auto-reconnect after a broker restart - though v2.12.2's write
+failure now TRIGGERS the reconnect path, so the next mosquitto run may exercise
+it for free; persistent store; TLS end to end (1.2).
