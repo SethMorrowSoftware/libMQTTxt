@@ -88,9 +88,46 @@ CONFIRMED.
    enabled. A caller now gets `ERROR: timeout (connection reset)` and a
    `disconnected` state change, instead of a connection that answers nothing.
 
-**What to check on the mosquitto side** before reading the next run:
-`message_size_limit` in `mosquitto.conf` and `conf.d/`. If it sits between 64 KB
-and 128 KB, explanation 2 is the whole story.
+**Fourth run, same day, mosquitto again, v2.12.2 with per-rung write timing.**
+The instrument answered the question it was built to answer:
+
+    rung        write call   result
+    4096 B         12 ms     ok
+    16384 B        12 ms     ok
+    65536 B        13 ms     ok
+    131072 B       16 ms     ok      <- this size FAILED in run 3
+    204800 B    10056 ms     ERROR: timeout (connection reset)
+
+Then, for the first time: `ERROR writing PUBLISH: timeout - the stream may be
+corrupt; resetting the connection`, `Auto-reconnect disabled` (not ticked), and
+a clean `ABORT the connection dropped mid-run` - the v2.12.2 reset working as
+designed instead of a connection that answers nothing.
+
+**Two readings, both INFERRED from the timings:**
+
+- **The write is buffer-bound, not throughput-bound.** 4 KB and 128 KB take the
+  same 12-16 ms: the synchronous write is handing bytes to the kernel send
+  buffer and returning the moment the kernel accepts them. It blocks only when
+  the buffer is FULL, and then it blocks for the whole `socketTimeoutInterval`
+  - which means the remote did not drain a single buffer's worth in ten
+  seconds, on a LAN. Explanation 1 above (an engine write path too slow) is
+  therefore WRONG: the path is fast right up to the cliff.
+- **The ceiling is not a fixed broker limit.** 131072 bytes failed in run 3 and
+  passed in run 4, same broker, same engine, same machine. A `message_size_limit`
+  would refuse the same size every time. What varies run to run is the kernel's
+  send-buffer size (TCP autotuning), which fits a cliff that moves.
+
+**What is NOT yet established:** why the remote stops draining. The test
+subscribes to its own topic, so every publish is echoed back over the same
+socket - and a synchronous write blocks the engine's event loop, so nothing on
+this side reads while it waits. Whether that pairing is a flow-control deadlock
+(each side waiting for the other to read) is the leading candidate and is
+UNPROVEN. The design decision this forces - whether the write path should stop
+blocking the engine at all - is under review; see the entry that follows this
+one when it lands.
+
+**Still worth checking on the mosquitto side:** `message_size_limit` in
+`mosquitto.conf` and `conf.d/`, if only to close that door formally.
 
 ### 1.2 `secure socket ... with verification` reports success on a plaintext port
 **OBSERVED 2026-09-05.** `secure socket` was applied to a connection on port
@@ -188,8 +225,15 @@ seen through two instruments, and the third is its cascade - see 1.1. Nothing
 new failed in the library; what this run did was confirm the diagnosis and show
 that reporting a bad write is not the same as recovering from it.
 
-**Still untested:** the mosquitto ladder with v2.12.2 and the write timings
-(1.1); multi-connection (needs `kCtHost2` set - the library keys connections by
-`host:port`); auto-reconnect after a broker restart - though v2.12.2's write
-failure now TRIGGERS the reconnect path, so the next mosquitto run may exercise
-it for free; persistent store; TLS end to end (1.2).
+### Fourth run, 2026-09-05, OXT + mosquitto 192.168.1.104 (v2.12.2)
+
+9 passed, 2 failed, 0 skipped, and the run ABORTED cleanly at the 204800-byte
+rung - which is the v2.12.2 reset doing its job. The two failures are one event
+(the timed-out write) and its consequence (the abort). Nothing else regressed.
+The write timings are in 1.1 and they change the diagnosis.
+
+**Still untested:** whatever the write-path decision becomes (1.1);
+multi-connection (needs `kCtHost2` set - the library keys connections by
+`host:port`); auto-reconnect after a broker restart - the operator had it
+unticked this run, so the reset stopped at "Auto-reconnect disabled"; persistent
+store; TLS end to end (1.2).
