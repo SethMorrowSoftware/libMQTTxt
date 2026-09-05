@@ -395,9 +395,17 @@ That same run found two things the gates could not:
   port.** Treat TLS status as unverified regardless of what the log says, and
   confirm a TLS connection reached CONNACK before trusting it. Not yet closed.
 
-**Still unproven:** keep-alive end to end, auto-reconnect after a broker
-restart, multi-connection, persistent store, and TLS. The performance figures
-below are from 2.11.x and have not been re-measured.
+A second run the same day, against `broker.hivemq.com` with the write check
+in place, added **keep-alive end to end** (100s idle, PINGRESP received and
+processed), **large payloads to 200 KB**, **retained replay**, **zero-length
+payloads** and **unsubscribe** to the observed list. It also found the
+conformance test asserting the QoS 2 acknowledgment leg one line too early —
+the library was right.
+
+**Still unproven:** the 200 KB re-run against the mosquitto that originally
+failed (a different broker from the one that passed), auto-reconnect after a
+broker restart, multi-connection, persistent store, and TLS. The performance
+figures below are from 2.11.x and have not been re-measured.
 
 ## Performance
 

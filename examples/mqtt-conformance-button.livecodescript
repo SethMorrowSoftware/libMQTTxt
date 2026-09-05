@@ -259,8 +259,14 @@ command ctStageRoundTrip pLeaf, pQoS, pLabel
       exit ctStageRoundTrip
    end if
 
-   put sCtSeen[tTopic] into tGot
-   if tGot is not empty then
+   -- phase 1: wait for the echo
+   if sCtPhase < 2 then
+      put sCtSeen[tTopic] into tGot
+      if tGot is empty then
+         ctDeadline pLabel & ": nothing came back", kCtDeadline
+         exit ctStageRoundTrip
+      end if
+
       if tGot is ("payload-" & pLeaf) then
          ctPass pLabel & " (delivered " & sCtCount[tTopic] & "x)"
       else
@@ -279,23 +285,37 @@ command ctStageRoundTrip pLeaf, pQoS, pLabel
          end if
       end if
 
-      -- At QoS > 0 the library holds the message until the broker acknowledges
-      -- it. A pendingAcks entry still standing here means the ack leg did not
-      -- complete, whatever the payload says.
-      if pQoS > 0 then
-         local tInfo
-         put mqttGetConnectionInfo(sCtHost, sCtPort) into tInfo
-         if tInfo["pendingAcks"] is empty then
-            ctPass "  the QoS " & pQoS & " acknowledgment leg drained"
-         else
-            ctFail "  the QoS " & pQoS & " acknowledgment leg", \
-                  "pendingAcks still holds an entry"
-         end if
+      if pQoS is 0 then
+         ctNext
+         exit ctStageRoundTrip
       end if
+
+      -- QoS > 0: the acknowledgment leg is a SEPARATE wait, below.
+      put 2 into sCtPhase
+      put 0 into sCtTicks
+      exit ctStageRoundTrip
+   end if
+
+   -- phase 2: wait for the outbound acknowledgment leg to drain.
+   --
+   -- THE ECHO ARRIVING DOES NOT MEAN OUR HANDSHAKE IS DONE, and the first
+   -- version of this stage assumed it did. At QoS 2 there are TWO exchanges in
+   -- flight with independent packet IDs: ours (PUBLISH -> PUBREC -> PUBREL ->
+   -- PUBCOMP, which clears pendingAcks) and the broker's delivery back to us
+   -- (PUBLISH -> PUBREC -> PUBREL, which hands over the message). The echo is
+   -- delivered on the broker's PUBREL, and on a real run (2026-09-05, hivemq)
+   -- our PUBCOMP arrived one line AFTER the check - so a correct library was
+   -- reported as leaving an ack outstanding. Observed, and the reason this is
+   -- a poll with a deadline rather than an assertion.
+   local tInfo
+   put mqttGetConnectionInfo(sCtHost, sCtPort) into tInfo
+   if tInfo["pendingAcks"] is empty then
+      ctPass "  the QoS " & pQoS & " acknowledgment leg drained"
       ctNext
       exit ctStageRoundTrip
    end if
-   ctDeadline pLabel & ": nothing came back", kCtDeadline
+   ctDeadline "  the QoS " & pQoS & " acknowledgment leg: pendingAcks still " \
+         & "holds an entry", kCtDeadline
 end ctStageRoundTrip
 
 -- THE FRAMING PROOF. A payload whose byte count and character count differ is
