@@ -476,7 +476,23 @@ MQTT 3.1.1 Specification Implementation:
 
 ## Version History
 
-### 2.12.1 (Current)
+### 2.12.2 (Current)
+
+One change, from the third engine run of the day (mosquitto on a LAN):
+
+- **A failed write now resets the connection.** 2.12.1 caught the failure and
+  reported `ERROR: timeout` — then left the connection up with a corrupt output
+  stream, so every later write was read by the broker as the tail of the broken
+  packet and nothing was acknowledged, echoed, or pinged back. Reporting was
+  half the fix. `__failWrite` now tears the connection down at the instant any
+  write fails and schedules a reconnect if one is enabled; the caller gets
+  `ERROR: <reason> (connection reset)` and a `disconnected` state change.
+- The write ceiling is **path-dependent**: 64 KB passes and 128 KB fails on
+  mosquitto over a LAN; 200 KB passes on hivemq over the internet. The cause is
+  not yet established and the conformance ladder now times every write to
+  settle it. See `docs/ENGINE-NOTES.md` 1.1.
+
+### 2.12.1
 
 Everything here came from the first run on a real engine (2026-09-05), and
 neither item was reachable by any static gate.

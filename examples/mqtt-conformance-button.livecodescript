@@ -59,6 +59,7 @@ local sCtUtf8, sCtBin, sCtBig
 local sCtHoldEnd, sCtKey2
 local sCtPhase           -- sub-state within a multi-step stage
 local sCtBigStep, sCtBigOk   -- the large-payload ladder's position and high-water mark
+local sCtWriteMs             -- how long the current rung's write call took
 
 on mouseUp
    if sCtRunning is "true" then
@@ -129,6 +130,10 @@ command ctBegin
    ctSay "   broker " & sCtHost & ":" & sCtPort
    ctSay "   topics under " & sCtBase & "/"
    ctSay "   library " & mqttTestLibrary()
+   -- The engine property that bounds a synchronous socket write. A large
+   -- PUBLISH that exceeds it fails with "timeout" (engine notes 1.1), so the
+   -- value belongs in the record beside any size that fails.
+   ctSay "   socketTimeoutInterval " & the socketTimeoutInterval & "ms"
 
    send "ctTick" to me in kCtTickMs milliseconds
 end ctBegin
@@ -418,11 +423,25 @@ command ctStageBig
       end repeat
       put tPayload into sCtBig
 
+      -- TIME THE WRITE. This is the measurement that separates the two
+      -- explanations for a size that fails: if the write time grows roughly
+      -- in step with the size and the failing rung hits the socketTimeoutInterval,
+      -- the engine's synchronous write is throughput-bound and a longer
+      -- interval would let it finish; if the smaller rungs are instant and one
+      -- rung fails outright, something is refusing the size, and no timeout
+      -- setting will help.
+      local tT0, tWriteMs
+      put the milliseconds into tT0
       put mqttPublish(sCtHost, sCtPort, tTopic, sCtBig, 1, false) into tRc
+      put the milliseconds - tT0 into tWriteMs
+      put tWriteMs into sCtWriteMs
+
       if tRc is not "OK" then
          -- A refusal is an ANSWER, not a timeout: the library or the broker
-         -- said no, and said why.
-         ctFail "large payload at " & tSize & " bytes", tRc
+         -- said no, and said why. The write time says WHICH.
+         ctFail "large payload at " & tSize & " bytes", tRc \
+               & " (the write call took " & tWriteMs & "ms; socketTimeoutInterval " \
+               & "is " & the socketTimeoutInterval & "ms)"
          ctNext
          exit ctStageBig
       end if
@@ -437,7 +456,8 @@ command ctStageBig
          add 1 to sCtBigStep
          put 0 into sCtTicks
          put false into sCtEntered
-         ctSay "      " & tSize & " bytes round-tripped intact"
+         ctSay "      " & tSize & " bytes round-tripped intact (write call " \
+               & sCtWriteMs & "ms, " & ctRate(tSize, sCtWriteMs) & ")"
       else
          ctFail "large payload at " & tSize & " bytes", "got back " \
                & the number of bytes of tGot & " bytes"
@@ -456,6 +476,15 @@ command ctStageBig
       ctNext
    end if
 end ctStageBig
+
+-- KB/s for the record, with a floor of 1ms so an instant write does not divide
+-- by zero and read as infinite.
+function ctRate pBytes, pMs
+   if pMs < 1 then
+      put 1 into pMs
+   end if
+   return (round((pBytes / 1024) / (pMs / 1000))) & " KB/s"
+end ctRate
 
 -- The ladder. Doubling from 4 KB: 64 KB is the first size past a typical
 -- socket buffer, and 128 KB is the first whose Remaining Length needs three
