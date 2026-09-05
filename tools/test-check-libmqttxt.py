@@ -53,8 +53,11 @@ CASES = [
     ),
     (
         "undeclared catch variable",
-        lambda s: mutate(s, "   local tPacket, tError\n   put __buildPubRecPacket",
-                         "   local tPacket\n   put __buildPubRecPacket"),
+        lambda s: mutate(s,
+                         "   local tError\n   try\n"
+                         '      read from socket pSocketID with message "mqttSocketDataAvailable"',
+                         "   try\n"
+                         '      read from socket pSocketID with message "mqttSocketDataAvailable"'),
         "is never declared",
     ),
     (
@@ -90,6 +93,16 @@ CASES = [
         lambda s: mutate(s, "read from socket pSocketID with message",
                          "read from socket pSocketID for 1 with message"),
         "one message PER BYTE",
+    ),
+    (
+        "an unchecked socket write",
+        lambda s: mutate(s, "      put __writeSocket(pConnID, tPacket) into tError\n"
+                            "      if tError is empty then\n"
+                            '         __mqttDebug "PUBREC sent for packet" && pPacketID',
+                         "      write tPacket to socket pConnID\n"
+                            "      if tError is empty then\n"
+                            '         __mqttDebug "PUBREC sent for packet" && pPacketID'),
+        "bare `write ... to socket`",
     ),
     (
         "a control reference in the headless library",
