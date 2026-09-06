@@ -289,6 +289,60 @@ only, keeping DISCONNECT synchronous - which is the design the Last Will
 objection below ruled out for ALL writes, and which that objection does not
 actually reach when it is confined to publishes.
 
+### The eighth run: the echo is exonerated too
+**OBSERVED 2026-09-06**, mosquitto at 192.168.1.104:1883 in the clear, v2.12.6
+(chunking AND the yield), `socketTimeoutInterval` 10000. The experiment above
+ran, and it answered:
+
+    FAIL  1048576 bytes to a topic nothing echoes back
+          ERROR: timeout after 327680 of 1048619 bytes (connection reset)
+          the write call took 10123ms
+
+327680 is twenty 16 KB chunks. Twenty went out with a yield between each, and
+the twenty-first blocked for the full ten seconds. **Nothing was subscribed to
+that topic**, so there was no echo to back up, and the yield had been giving the
+event loop its turn all along.
+
+**So the echo hypothesis is dead, and so is the yield as a fix for this.** The
+run before it killed the send-buffer hypothesis. What survives:
+
+| reading | status |
+| --- | --- |
+| one `send()`, unsent tail discarded | refuted (run 7: six chunks, then a wall) |
+| the broker blocked on an echo we were not reading | refuted (run 8: no echo, same wall) |
+| the engine's plaintext write path stalls | **standing** |
+| this broker, or this network path, stalls | **standing** |
+| the engine needs elapsed time, not just a turn, to drain | **standing** |
+
+The shape is consistent across all four failures: a burst of chunks accepted at
+memcpy speed, then one chunk that makes zero progress for exactly the socket
+timeout. The amount that gets through moves run to run - 98304, 180224, 327680 -
+which still fits a buffer whose size varies and still rules out any fixed
+per-packet limit the broker might impose.
+
+**What v2.12.7 does about it, which is instrumentation and not a fix.** Two
+experiments, because the remaining readings need different ones:
+
+1. **A second broker, in the clear** (`ctStageAltWrite`, now the run's FIRST
+   stage): the same megabyte published to broker.hivemq.com:1883 on its own
+   connection, before anything else, judged by its PUBACK. It runs first
+   precisely because a stall later aborts the run. If the engine writes a
+   megabyte of plaintext to a broker across the internet without stalling, the
+   engine's write path is exonerated and the local broker or the LAN path owns
+   this. If it stalls there too, the write path is the suspect and TLS is the
+   only shape that has ever carried this much.
+2. **`mqttSetWriteYieldMs`**: the inter-chunk yield becomes a settable pause.
+   Zero, the default, is a yield with no elapsed time. Setting it to 20 or 50
+   tests whether the engine needs real time to push what it has accepted -
+   without editing the library.
+
+**And the observation this most needs is not on the client at all.** Nobody has
+yet looked at what mosquitto does during the stall. Running it in the foreground
+with `mosquitto -v`, or reading its log while the ladder runs, would say in one
+line whether the broker is refusing the packet, hitting a limit, or simply not
+being handed the bytes. That is a cheaper answer than any further inference from
+this side, and it is the next thing to do.
+
 ### 1.4 A DISCONNECT written just before `close socket` may not reach the broker
 **INFERRED (2026-09-06), not yet observed, recorded so it is not lost.**
 
@@ -414,7 +468,8 @@ afterwards (OBSERVED).
 ## 2. Lifecycle
 
 ### 2.1 An embedded library's preOpenStack initialisation did not take effect on a fresh engine
-**OBSERVED 2026-09-06** (the FAIL line); **cause not established.**
+**OBSERVED 2026-09-06** (the FAIL line); **cause established by the eighth run:
+the stack must be REOPENED, not have its script applied while open.**
 
 Fifth engine run, on a stack named "Untitled 2" rather than the "Untitled 1"
 of runs one to four. The boot self-check reported:
@@ -503,6 +558,22 @@ is what will tell the two paths apart on a fresh engine.
 `mdStart` as well, and the library initialises itself; `preOpenStack` is now
 belt, braces and a third fastener. The demo header says REOPEN in capitals for
 the same reason.
+
+**Eighth run, 2026-09-06: the question is closed.** On a REOPENED stack the
+boot block read `14 passed, 0 failed`, marker included:
+
+    PASS  preOpenStack fired before openStack (marker: true)
+    PASS  the library is initialised: keep-alive threshold set (0.75)
+
+Same stack, same engine, same script as the run that failed the marker
+assertion; the only difference was reopening rather than applying the script to
+an open stack. So the engine was never at fault. **Applying a script to an open
+stack sends neither `preOpenStack` nor `openStack`**, which is also why the
+sixth run produced no boot block at all - and the runs whose marker was empty
+had reached `openStack` through some later route with `preOpenStack` never
+delivered. Class this OBSERVED and the entry closed. The library's
+self-initialisation stands anyway: an embedder will make this mistake, and the
+failure it used to cause was a connection that could not receive a single byte.
 
 ### 2.2 The engine's `socketClosed` reaches the library
 **OBSERVED 2026-09-06.** Connecting in the clear to broker.hivemq.com:8883 - the
@@ -665,3 +736,25 @@ either (2.1). Two stacks, two sessions, same shape.
 chunks, under a re-entrancy lock, and the conformance run gets a stage that
 publishes 1 MB to a topic nothing echoes back - the experiment that tells the
 echo stall apart from a broken write path. Both are in the next run.
+
+### Eighth run, 2026-09-06, OXT + mosquitto 192.168.1.104:1883, v2.12.6
+
+9 passed, 2 failed, and **the experiment answered: the echo is exonerated**
+(1.1). A 1 MB publish to a topic with no subscriber stalled after twenty of
+sixty-four chunks, with the yield in place. Two hypotheses are now refuted and
+three stand; v2.12.7 ships the instruments that separate them rather than a
+third guess at a fix.
+
+**Also newly OBSERVED, and this one is green:**
+
+- **The boot self-check passed 14 of 14 on a reopened stack**, `preOpenStack`
+  marker included - the first fully clean boot block of the project (2.1). Two
+  runs had shown that assertion failing; reopening the stack rather than
+  applying the script to an open one is what changed, which confirms the demo
+  header's instruction and closes the open question in 2.1.
+- **The yield did not break anything.** Every stage before the large payloads
+  passed exactly as before: SUBSCRIBE, QoS 0/1/2 with their ack legs,
+  exactly-once, UTF-8, all 256 byte values, with the dashboard's own
+  subscription live alongside the run. The re-entrancy lock cost nothing
+  observable.
+- **`__failWrite` and the abort path**, for the fourth and fifth time.

@@ -426,22 +426,27 @@ refused every attempt, and a manual disconnect stopped it cleanly. It also
 found the reconnect log line reporting a clamped attempt number, fixed in
 2.12.5.
 
-The seventh run took that ladder back to the mosquitto LAN path in the clear —
-and **refuted the diagnosis.** Chunking worked exactly as designed and the write
-stalled anyway: six 16 KB chunks out, the seventh blocked for the full ten
-seconds, then the same shape one rung higher on a second run. A chunk that
-succeeds six times and stalls on the seventh was never too big. The peer had
-stopped reading, and the reading that now fits is that we stopped reading first:
-a synchronous write never returns to the event loop, so the echo of our own
-publish backs up and the broker cannot flush to us. 2.12.6 yields between
-chunks. Everything before the ladder passed on that path, twice.
+Runs seven and eight took that ladder back to the mosquitto LAN path in the
+clear and **refuted two diagnoses in a row.** Chunking worked as designed and
+the write stalled anyway; then the yield was added and a megabyte to a topic
+with *no subscriber* stalled after twenty of sixty-four chunks. So neither the
+send-buffer reading nor the echo reading survives. What survives is a stall in
+the write path itself, in this broker, or in the LAN path to it. Every failure
+has the same shape: a burst of chunks accepted instantly, then one chunk making
+zero progress for exactly the socket timeout.
 
-**Still unproven:** whether the yield fixes it, and whether the echo is really
-the cause — the next run answers both, because the conformance button now
-publishes 1 MB to a topic nothing echoes back before it runs the ladder. Also
-unproven: a reconnect that *succeeds* and resubscribes; multi-connection; the
-persistent store; and certificate verification rejecting a bad certificate. The
-performance figures below are from 2.11.x and have not been re-measured.
+**The known limitation, stated plainly:** on a low-latency plaintext path to a
+local mosquitto, a publish of roughly 100 KB or more may stall and reset the
+connection. The library detects it, reports how many bytes went out, and tears
+the connection down rather than leaving a corrupt stream — but the publish does
+not go through. The same engine carries 1 MB over TLS to a remote broker without
+trouble. 2.12.7 ships the two experiments that separate the remaining causes,
+and the conformance button runs the first of them before anything else.
+
+**Still unproven:** the cause of that stall; a reconnect that *succeeds* and
+resubscribes; multi-connection; the persistent store; and certificate
+verification rejecting a bad certificate. The performance figures below are from
+2.11.x and have not been re-measured.
 
 ## Performance
 
@@ -512,7 +517,30 @@ MQTT 3.1.1 Specification Implementation:
 
 ## Version History
 
-### 2.12.6 (Current)
+### 2.12.7 (Current)
+
+From the eighth engine run, which **refuted the 2.12.6 diagnosis too**. This
+release is instrumentation, not a fix: two hypotheses are now dead and three
+stand, and guessing a third time is not the way to settle it.
+
+- **The echo is not the cause.** A 1 MB publish to a topic with *no subscriber*
+  stalled after twenty of sixty-four chunks, with the yield in place. There was
+  nothing to echo and nothing backing up inbound.
+- **A write-path probe now runs first in the conformance button.** It publishes
+  the same megabyte in the clear to a second broker over a different network
+  path, on its own connection, before anything else — because a stall later in
+  the run aborts everything after it. If that passes, the engine writes large
+  plaintext fine and the local broker or LAN path owns the stall. If it fails,
+  the engine's plaintext write path is the suspect, since TLS is the only shape
+  that has carried this size.
+- **`mqttSetWriteYieldMs`** makes the inter-chunk yield a settable pause. Zero,
+  the default, is a yield costing no elapsed time. A non-zero value tests
+  whether the engine needs real time rather than a turn of the loop to drain
+  what it has accepted.
+- The yield and its re-entrancy lock from 2.12.6 cost nothing observable: every
+  stage before the large payloads passed unchanged.
+
+### 2.12.6
 
 From the seventh engine run, which **refuted the 2.12.3 diagnosis**. See
 `docs/ENGINE-NOTES.md` 1.1.
