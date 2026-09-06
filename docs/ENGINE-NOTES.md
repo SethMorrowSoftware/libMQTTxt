@@ -398,6 +398,68 @@ produces decides between a paced default and asynchronous writes, which
 self-pace because the engine reports each chunk as it goes. Async is now the
 favourite for the eventual fix; the pacing number tells us how much it is worth.
 
+### The tenth run: pacing is the cure, and the number is measured
+**OBSERVED 2026-09-06.** The ladder ran against broker.hivemq.com:1883 in the
+clear, one megabyte per rung on a fresh connection:
+
+    pause per chunk   result
+    0 ms              timeout after 65536 of 1048615 bytes
+    5 ms              timeout after 65536 of 1048615 bytes
+    20 ms             timeout after 65536 of 1048615 bytes
+    50 ms             PUBACKed, 3287 ms
+
+**65536 bytes, three times, to the byte.** The stall point does not move with
+the pause, only with the path - it is that path's send-buffer capacity, and the
+pause decides whether the buffer is ever driven into it. That is the mechanism
+confirmed by construction rather than inferred: **the write outruns the link,
+and slowing it down fixes it.** Promote the pacing half of 1.1 to OBSERVED. The
+send-and-do-not-retry behaviour inside the engine stays INFERRED - still nobody
+has read the engine's source - but it is now the only reading with no
+competitor.
+
+**Then the pause was kept for the rest of the run, and the whole thing went
+green against mosquitto on the LAN: 16 passed, 0 failed, 1 skipped**, ladder to
+1 MB included, the un-echoed megabyte included, keep-alive across 100 s
+included. The first fully green conformance run of the project.
+
+**And the timings say exactly what the pause costs.** Every rung reports the
+same throughput, on both brokers, on both networks:
+
+    payload      chunks  pauses x 50ms   observed   pause is   real write work
+    65536 B        4        150 ms        216 ms      69%          66 ms
+    131072 B       8        350 ms        420 ms      83%          70 ms
+    204800 B      13        600 ms        626 ms      96%          26 ms
+    524288 B      32       1550 ms       1647 ms      94%          97 ms
+    1048576 B     64       3150 ms       3289 ms      96%         139 ms
+
+Actual write work is 26-139 ms whatever the size; the rest is the pause. The
+"311 KB/s" every rung reports is not the network - it is 16384 bytes / 50 ms =
+320 KB/s, the rate the pause permits, and nothing else. A megabyte's worth of
+real writing took 139 ms, so **the LAN could carry this an order of magnitude
+faster and the pause is throwing that away.**
+
+**BUILT IN 2.13.0, and the argument for it is below.** The pacing default of
+50 ms stays as the fallback path; asynchronous writes replace it as the default.
+The design and its one risk are in section 4.
+
+**Which is the argument for the eventual fix.** The required pause is set by the
+slowest link an application uses: this operator's uplink sits somewhere between
+320 KB/s (works) and 800 KB/s (fails), while their LAN is far quicker. One fixed
+number cannot serve both, and a default must be safe, so v2.12.8 defaults to 50
+and documents the cost. **Asynchronous writes are the right answer** - the
+engine reports each chunk as it is actually written, so the next one goes when
+the socket is ready, at exactly the link's rate with no guessing and no waste.
+That is a real change: it needs a per-connection outbound queue so a control
+packet cannot jump ahead of a queued publish, and it changes what `mqttPublish`
+returning `OK` means from "written" to "queued". Worth doing, worth doing
+carefully, and not worth bolting onto a run that just went green.
+
+**Also OBSERVED this run:** a CONNECT to a routable address with nothing
+listening produced `ERROR sending CONNECT: socket closed after 0 of 30 bytes` -
+the engine accepted `open socket`, the peer closed, and the write check caught
+it on the CONNECT itself with an exact byte count. The 2.12.1 write check
+working on the one packet that had never exercised it.
+
 ### 1.4 A DISCONNECT written just before `close socket` may not reach the broker
 **INFERRED (2026-09-06), not yet observed, recorded so it is not lost.**
 
@@ -792,6 +854,92 @@ chunks, under a re-entrancy lock, and the conformance run gets a stage that
 publishes 1 MB to a topic nothing echoes back - the experiment that tells the
 echo stall apart from a broken write path. Both are in the next run.
 
+### Eleventh session, 2026-09-06, four runs against mosquitto by two addresses, v2.12.7
+
+Four runs in one engine session, ending at **17 passed, 0 failed, 1 skipped -
+the most complete run of the project.** The operator drove the broker through
+two spellings (`192.168.1.104` and `127.0.0.1`), which is what finally let the
+last untested stage run.
+
+**Newly OBSERVED, and it is the one that had never run:**
+
+- **Two simultaneous connections, with independent keep-alive chains.** The
+  second connection was opened to `192.168.1.104:1883` while the run was
+  connected to `127.0.0.1:1883` - the same mosquitto, two keys, because the
+  library keys a connection by `host:port`. Then both were held idle for 100 s
+  at DIFFERENT keep-alive intervals, 30 s against the dashboard's 60 s:
+
+      PASS  a second connection is live alongside the first
+      PASS  the connection survived 100s idle AND a PINGRESP was received
+      PASS  the SECOND connection also survived - the two keep-alive chains
+            ran on their own schedules
+
+  **This is the timer-token work of 2.12.0 proved on an engine.** Before that
+  fix a single delayed message served every connection, so whichever timer fired
+  first pinged both and the other was serviced on a schedule that was not its
+  own. Two chains on two intervals surviving 100 s each is exactly the
+  observation that could not be made until now, and it is the last stage of the
+  conformance button to go green.
+- **Repeatability.** The whole suite ran green three times over in one session,
+  against two addresses, with packet IDs continuing across runs on a reused
+  connection (21, 22, 23... in the last run) - so the packet-ID allocator does
+  not restart or collide when a connection outlives a run.
+
+**Found, and it is a defect in the harness rather than the library.** A run
+cancelled mid-hold by a second click printed:
+
+    -- run cancelled by a second click --
+          15 passed, 0 failed, 1 skipped - RUN FINISHED
+          conformance run GREEN against 127.0.0.1:1883
+
+**Zero failures is not a pass when the stages that would have failed never
+ran.** This file's own header promises a report that says when it is not
+finished, and `ctFail` already carries that lesson one level up in its cascade
+NOTE; the cancel path was the hole in it. `ctFinish` now records WHY a run
+stopped and prints `RUN NOT FINISHED (<reason>)` with the stage it died on,
+never GREEN. The abort path shares the mechanism.
+
+**Also found:** the pacing ladder skipped in three of these runs because
+`kCtAltHost` had been set to the same address the run was using, and one
+connection per `host:port` is all the library can hold. That is a real
+constraint, so the skip message now names the remedy - another spelling of the
+same broker, which is exactly the trick the operator had already used for
+`kCtHost2`. **The LAN pacing figure is therefore still unmeasured**; every
+50 ms value in these runs came from the hivemq ladder in the first run and
+persisted in the global for the rest of the session.
+
+**Worth knowing for the next run:** these were all v2.12.7, whose default pause
+is 0. The runs only worked because the first ladder set 50 ms and the global
+survived. **On a fresh engine v2.12.7 would fail the large payloads again** -
+v2.12.8's default of 50 is what makes that survive a restart, and it has not
+been run yet.
+
+### Tenth run, 2026-09-06, OXT + broker.hivemq.com then mosquitto, v2.12.7
+
+**16 passed, 0 failed, 1 skipped - the first fully green conformance run.** The
+pacing ladder found 50 ms per chunk, kept it, and every stage that had ever
+failed then passed against the LAN broker (1.1).
+
+**Newly OBSERVED:**
+
+- **Pacing is the cure.** 0, 5 and 20 ms all stalled at exactly 65536 bytes;
+  50 ms carried a megabyte. The stall point is the path's buffer; the pause
+  decides whether it is ever filled.
+- **The whole protocol surface, green in one run:** SUBSCRIBE/SUBACK, QoS 0/1/2
+  with ack legs and exactly-once, UTF-8 and all 256 byte values, a megabyte both
+  echoed and un-echoed, the full size ladder, retained replay and clear,
+  unsubscribe with the negative check, and keep-alive across 100 s idle.
+- **What the pause costs**, from the per-rung timings: 94-96% of the elapsed
+  time on large payloads. Real write work is 26-139 ms regardless of size.
+- **The write check on CONNECT**: a connect to a routable address with nothing
+  listening reported `socket closed after 0 of 30 bytes`.
+
+**Not tested, still:** `kCtHost2` was empty so multi-connection skipped again;
+the persistent store; a reconnect that succeeds; certificate verification
+refusing a bad certificate. `preOpenStack` did not fire because the script was
+applied to an open stack rather than reopened, which is 2.1 behaving as
+documented.
+
 ### Ninth run, 2026-09-06, OXT + mosquitto AND broker.hivemq.com, both :1883, v2.12.7
 
 9 passed, 3 failed - and the three failures are one finding, which is the
@@ -840,3 +988,102 @@ third guess at a fix.
   subscription live alongside the run. The re-entrancy lock cost nothing
   observable.
 - **`__failWrite` and the abort path**, for the fourth and fifth time.
+
+---
+
+## 4. The asynchronous write path (2.13.0)
+
+**DESIGNED FROM RUNS 7-10, NOT YET RUN ON AN ENGINE.** Everything here is
+`verified statically; needs an OXT pass`. The gates behind it are
+`tools/test-write-queue.py` (the ordering property, nine cases) and rule 13 of
+`tools/check-libmqttxt.py` (only the pump may start an asynchronous write).
+
+### Why
+
+Section 1.1 ends with a measured cure and a bad bargain: a fixed pause per chunk
+keeps a large write inside the link's drain rate, and the tenth run showed that
+pause accounting for 94-96% of a megabyte's elapsed time. The pause has to be
+sized for the slowest link an application will ever use, so a LAN pays for an
+uplink it never touches.
+
+The engine will instead report each write as it completes. A chunk started only
+on that report cannot outrun anything: the queue drains at exactly the rate the
+socket accepts. That is the same cure with the guesswork removed.
+
+### The shape
+
+One queue per socket, in its own global - never in the connection record, since
+application code running during a callback can call `mqttCleanupAll`, and
+writing a key back into a deleted record recreates it as a zombie the keep-alive
+sweep walks forever (the lesson `__parseIncomingData` already carries).
+
+    __writeSocket        picks the path; every caller still uses only this
+      __enqueueWrite     appends, then pumps
+      __writeSocketSync  the 2.12.8 paced path, kept as the fallback
+    __pumpWriteQueue     starts ONE chunk if none is in flight
+    mqttSocketWriteDone  the engine's report; advances and pumps again
+    __dropWriteQueue     teardown, and before any synchronous DISCONNECT
+
+### The one risk, and what holds it
+
+**Two writes in flight on one socket interleave on the wire.** A PINGREQ started
+while a megabyte of PUBLISH is half-written lands *inside* that publish; the
+broker's framing desynchronises and never recovers, and neither side reports an
+error. It is the same corruption a stalled synchronous write used to cause,
+reached from the opposite direction.
+
+What prevents it is that **every** packet goes through the queue - not just the
+large ones - and the queue is strictly FIFO with at most one chunk outstanding.
+There is no direct path. Rule 13 of the static gate enforces that
+`__pumpWriteQueue` is the only caller of `__writeSocketAsync`, so the guarantee
+cannot be eroded by a later change that "just needs to send a PINGREQ now".
+
+Two subtler cases the model checks:
+
+- **An enqueue during a write.** A message callback that publishes runs while a
+  chunk is in flight. It appends and returns; the packet waits its turn.
+- **`mqttSetWriteChunkSize` called between a write and its completion.** The
+  completion must advance by the size actually written, so the pump records it
+  in `inflight` rather than letting the completion recompute it. Recomputing
+  leaves `pos` on the wrong byte and sends the packet's tail from the wrong
+  offset - silently. This was a real defect in the first draft, caught by
+  reading rather than by a run, and it is now a test case.
+
+### What it changes for a caller
+
+`mqttPublish` returning `OK` means **queued**, not written. A write that fails
+after that point cannot be returned to the caller, so it arrives the way any
+mid-connection failure does: the state-change callback with `disconnected` and a
+reason. For QoS 1 and 2 the acknowledgment was always the real proof of
+delivery; for QoS 0 the guarantee never existed. `mqttGetQueuedBytes` reports
+what is still owed to a socket.
+
+### Backpressure
+
+An application that publishes faster than its link can carry would grow the
+queue until the engine runs out of memory, and that failure lands nowhere near
+its cause. `__enqueueWrite` refuses a packet that would take the queue past
+`__maxBufferSize()` - the same ceiling that guards the inbound direction.
+
+### DISCONNECT stays synchronous
+
+Both teardown paths drop the queue and write DISCONNECT with
+`__writeSocketSync`. A queued DISCONNECT would be discarded by the `close
+socket` on the next line, the broker would see a bare TCP close, and **every
+clean disconnect would publish the Last Will** (1.4). `mqttCleanupAll` is the
+starkest case: no turn of the event loop ever follows it, so a queued write
+would never run at all. Anything still queued at that moment is abandoned
+deliberately and logged; a QoS 1 or 2 message among it is still in `pendingAcks`.
+
+### What the next run has to show
+
+1. **The conformance run still passes**, in the same shape as run 11's 17 of 17.
+   Ordering is the risk; a broken queue shows up as a stalled or nonsensical
+   stage, not as a slow one.
+2. **The ack times.** Under 2.12.8 every rung reported ~311 KB/s because the
+   pause set it. If the queue works, the megabyte's time-to-PUBACK should fall
+   towards the ~139 ms of real write work the tenth run measured. The
+   conformance button now prints time-to-acknowledgment beside the write call
+   for exactly this comparison.
+3. **`mqttSetAsyncWrites false`** must still behave like 2.12.8. If asynchronous
+   writes misbehave, that one line is the way back without pinning a version.

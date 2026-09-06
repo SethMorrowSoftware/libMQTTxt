@@ -26,6 +26,8 @@ global gMQTTTimerSeq              -- Monotonic counter that mints timer tokens
 global gMQTTWriteChunkSize        -- Largest single write handed to the kernel (bytes)
 global gMQTTWriteLocks            -- socket ID -> true while a multi-chunk write is in progress
 global gMQTTWriteYieldMs          -- how long to yield between chunks of a large write
+global gMQTTWriteQueues           -- socket ID -> the outbound queue behind asynchronous writes
+global gMQTTAsyncWrites           -- false falls back to the paced synchronous write path
 global gMQTTInitialized           -- true once mqttInitialize has run in this engine session
 
 -- ========================================
@@ -98,13 +100,34 @@ command mqttInitialize
    -- write path exists to prevent. Cleared here, never carried across a session.
    put empty into gMQTTWriteLocks
 
-   -- How long __writeSocket yields between chunks. Zero is one turn of the
-   -- event loop and no elapsed time, which is what a yield is for. It is
-   -- settable because the eighth engine run left one hypothesis standing that
-   -- a NON-zero value would test: that the engine needs real time, not just a
-   -- turn, to drain what it has accepted. See mqttSetWriteYieldMs.
+   -- How long __writeSocket pauses between chunks of a large write.
+   --
+   -- 50 IS A MEASURED VALUE, NOT A GUESS, and it is deliberately conservative.
+   -- The tenth engine run laddered 0, 5, 20 and 50 ms against a broker over
+   -- the internet: the first three stalled at exactly 65536 bytes every time
+   -- and 50 carried a megabyte. The pause is what keeps the write from
+   -- outrunning the link (docs/ENGINE-NOTES.md 1.1), so the safe value is set
+   -- by the SLOWEST link an application uses, and a default that is wrong is
+   -- better wrong slow than wrong broken.
+   --
+   -- It costs nothing for ordinary traffic: a packet that fits one chunk never
+   -- pauses at all, which is every control packet and almost every publish.
+   -- It caps a MULTI-chunk write at chunk/pause = 320 KB/s. On a LAN that is
+   -- far below what the link can do; lower it, or raise the chunk size, once
+   -- you have measured your own path.
    if gMQTTWriteYieldMs is empty then
-      put 0 into gMQTTWriteYieldMs
+      put 50 into gMQTTWriteYieldMs
+   end if
+
+   -- Outbound queues, one per socket. Cleared here and never carried across a
+   -- session: a queue holds bytes destined for a socket that no longer exists.
+   put empty into gMQTTWriteQueues
+
+   -- Asynchronous writes are the default from 2.13.0. The flag exists so a
+   -- deployment that hits trouble can fall back to the paced synchronous path
+   -- in one line rather than pinning an old version. See mqttSetAsyncWrites.
+   if gMQTTAsyncWrites is empty then
+      put true into gMQTTAsyncWrites
    end if
 
    put true into gMQTTInitialized
@@ -232,21 +255,28 @@ function mqttGetWriteChunkSize
    return gMQTTWriteChunkSize
 end mqttGetWriteChunkSize
 
--- How long a large write pauses between chunks, in milliseconds.
+-- How long a large write pauses between chunks, in milliseconds. Default 50.
 --
--- ZERO IS NOT "NO PAUSE", it is a yield: one turn of the engine's event loop,
--- costing pending messages their run and no elapsed time. That is what breaks
--- a stall caused by nothing servicing the inbound side.
+-- THIS IS A RATE LIMIT, and it is the difference between a large publish
+-- working and failing. The engine's plaintext write hands the kernel one
+-- non-blocking send and does not retry a socket that is momentarily full, so a
+-- write that outruns the link fills the send buffer and the next chunk times
+-- out with the stream half-sent (docs/ENGINE-NOTES.md 1.1, ten engine runs).
+-- The pause is what keeps the write inside the link's drain rate.
 --
--- A NON-ZERO VALUE IS A DIAGNOSTIC, and the eighth engine run is why it is
--- reachable from script. A large write still stalled on one path with the
--- yield in place and with no inbound traffic at all to explain it
--- (docs/ENGINE-NOTES.md 1.1). One reading still standing is that the engine
--- needs real elapsed time - not merely a turn of the loop - to push what it
--- has already accepted. Setting this to 20 or 50 tests that reading without
--- editing the library. It costs that many milliseconds per chunk, so a 1 MB
--- payload at 16 KB chunks and 20 ms is 1.3 seconds of deliberate delay: a
--- measurement, not a setting to leave on.
+-- THE ARITHMETIC IS chunk / pause. At the defaults that is 16384 bytes per
+-- 50 ms, so 320 KB/s. Raise this and a large write goes slower and is safer on
+-- a slow uplink; lower it and it goes faster until it outruns the link and
+-- fails. The tenth run measured a broker over the internet stalling at 0, 5
+-- and 20 ms and succeeding at 50.
+--
+-- ORDINARY TRAFFIC PAYS NOTHING. A packet that fits one chunk never pauses -
+-- every control packet, and almost every publish. This only ever governs a
+-- payload larger than mqttGetWriteChunkSize().
+--
+-- TO TUNE IT for your own path, run examples/mqtt-conformance-button: its
+-- first stage ladders the pause upward and reports the fastest one that
+-- carries a megabyte.
 command mqttSetWriteYieldMs pMilliseconds
    if pMilliseconds is not a number or pMilliseconds < 0 then
       __mqttLog "ERROR: Write yield must be a non-negative number; keeping" \
@@ -266,6 +296,51 @@ end mqttSetWriteYieldMs
 function mqttGetWriteYieldMs
    return gMQTTWriteYieldMs
 end mqttGetWriteYieldMs
+
+-- Choose how packets reach the socket. Asynchronous is the default.
+--
+-- ASYNCHRONOUS (true, the default): a packet is appended to a per-connection
+-- outbound queue and written one chunk at a time, each chunk started only when
+-- the engine reports the previous one written. That is self-pacing - the queue
+-- drains at exactly the rate the socket accepts, with no delay to guess at -
+-- and it is what the pacing measurements of runs 7 to 10 were pointing at.
+--
+-- WHAT IT CHANGES FOR A CALLER: `mqttPublish` returning "OK" means the packet
+-- is QUEUED, not that its bytes are on the wire. A write that fails after that
+-- point cannot be returned to the caller, so it arrives the same way any other
+-- mid-connection failure does: the state-change callback with "disconnected"
+-- and a reason. For QoS 1 and 2 the acknowledgment is the real proof of
+-- delivery anyway, and it always was.
+--
+-- SYNCHRONOUS (false): the pre-2.13.0 path, which writes chunks back to back
+-- and pauses mqttGetWriteYieldMs between them. Slower for large payloads and
+-- it blocks the engine while it runs, but it reports a write failure to the
+-- caller directly. Keep it if you depend on that, or fall back to it if
+-- asynchronous writes misbehave on your engine.
+--
+-- DISCONNECT is written synchronously either way. It is two bytes and the
+-- socket closes on the next line; a queued DISCONNECT would be discarded by
+-- that close and the broker would publish the Last Will on a clean exit.
+command mqttSetAsyncWrites pEnabled
+   if pEnabled is false then
+      put false into gMQTTAsyncWrites
+      __mqttLog "Asynchronous writes OFF - using the paced synchronous path" \
+            && "(" & __writeYieldMs() & "ms per chunk)"
+   else
+      put true into gMQTTAsyncWrites
+      __mqttLog "Asynchronous writes ON - the outbound queue paces itself"
+   end if
+end mqttSetAsyncWrites
+
+function mqttGetAsyncWrites
+   return __asyncWrites()
+end mqttGetAsyncWrites
+
+-- How many bytes are queued and not yet written for a connection. Zero when
+-- everything handed to the library has reached the socket.
+function mqttGetQueuedBytes pHost, pPort
+   return __queuedBytes(pHost & ":" & pPort)
+end mqttGetQueuedBytes
 
 command mqttSetPersistentStore pEnabled, pStorePath
    put pEnabled into gMQTTPersistentStoreEnabled
@@ -565,7 +640,14 @@ command mqttDisconnect pHost, pPort
       put __numToByte(0xE0) & __numToByte(0) into tPacket
 
       if __isSocketOpen(tConnID) then
-         put __writeSocket(tConnID, tPacket) into tErr
+         -- SYNCHRONOUS, AND THE QUEUE GOES FIRST. The socket closes a few
+         -- lines below, so a DISCONNECT sitting in the outbound queue would be
+         -- discarded by that close and the broker would treat a clean exit as
+         -- a dropped client - publishing the Last Will. Anything still queued
+         -- is abandoned deliberately and said out loud; a QoS 1 or 2 message
+         -- among it is still in pendingAcks and still the caller's to resend.
+         __dropWriteQueue tConnID
+         put __writeSocketSync(tConnID, tPacket) into tErr
          if tErr is not empty then
             __mqttDebug "Error writing DISCONNECT packet:" && tErr
          end if
@@ -892,8 +974,12 @@ command mqttCleanupAll
          if __isSocketOpen(tConnID) then
             put __numToByte(0xE0) & __numToByte(0) into tPacket
             -- A failed DISCONNECT is not worth reporting on a teardown path,
-            -- but it must not skip the close that follows it.
-            put __writeSocket(tConnID, tPacket) into tErr
+            -- but it must not skip the close that follows it. Synchronous for
+            -- the reason mqttDisconnect gives, and more so here: no turn of
+            -- the event loop ever follows mqttCleanupAll, so a queued write
+            -- would have no chance to run at all.
+            __dropWriteQueue tConnID
+            put __writeSocketSync(tConnID, tPacket) into tErr
             __closeSocketQuietly tConnID
          end if
       end repeat
@@ -908,10 +994,12 @@ command mqttCleanupAll
    put empty into gMQTTConnections
    put empty into gMQTTConnIndex
    put empty into gMQTTTimerTokens
+   put empty into gMQTTWriteQueues
+   put empty into gMQTTWriteLocks
 end mqttCleanupAll
 
 function mqttTestLibrary
-   return "MQTT Library v2.12.7 loaded successfully"
+   return "MQTT Library v2.13.0 loaded successfully"
 end mqttTestLibrary
 
 function mqttSelfTest
@@ -1044,7 +1132,7 @@ function mqttSelfTest
    -- Summary
    put "MQTT Library Self-Test" & return into tResults
    put "=====================" & return after tResults
-   put "Version: 2.12.7" & return after tResults
+   put "Version: 2.13.0" & return after tResults
    put "Passed:" && tPassed & return after tResults
    put "Failed:" && tFailed & return after tResults
 
@@ -1457,8 +1545,12 @@ private command __cleanupConnection pConnID, pReason
    __cancelPendingMessages pConnID
 
    -- Drop half-parsed inbound bytes: the next connection on this key starts a
-   -- new byte stream, and a leftover partial packet would frame it wrong.
+   -- new byte stream, and a leftover partial packet would frame it wrong. The
+   -- outbound queue goes for the mirror-image reason - bytes owed to a socket
+   -- that is being torn down belong to a stream that no longer exists, and
+   -- writing them into its replacement would corrupt that one too.
    put empty into gMQTTConnections[pConnID]["receiveBuffer"]
+   __dropWriteQueue pConnID
 
    -- Close socket if still open. Flag it first so the socketClosed this
    -- provokes is recognised as ours and does not re-enter the failure path.
@@ -1488,7 +1580,238 @@ end __cleanupConnection
 -- packet - so it stops acknowledging, stops echoing, and answers no PINGREQ,
 -- while the client sees clean writes and a socket the engine still calls open.
 -- The connection is dead in one direction and nothing on either side says so.
+-- THE ONE ENTRY POINT for every packet this library sends, and the only place
+-- that decides how it gets there. Callers do not know or care which path runs.
+--
+-- Returns empty when the packet has been accepted, or error text. Under
+-- asynchronous writes "accepted" means QUEUED - see mqttSetAsyncWrites for what
+-- that changes and why the acknowledgment, not this return value, is what
+-- proves a QoS 1 or 2 publish arrived.
 private function __writeSocket pSocketID, pPacket
+   if __asyncWrites() then
+      return __enqueueWrite(pSocketID, pPacket)
+   end if
+   return __writeSocketSync(pSocketID, pPacket)
+end __writeSocket
+
+private function __asyncWrites
+   return gMQTTAsyncWrites is not false
+end __asyncWrites
+
+private function __writeChunkSize
+   if gMQTTWriteChunkSize is not a number or gMQTTWriteChunkSize < 512 then
+      return 16384
+   end if
+   return gMQTTWriteChunkSize
+end __writeChunkSize
+
+private function __queuedBytes pSocketID
+   if gMQTTWriteQueues[pSocketID]["bytes"] is not a number then
+      return 0
+   end if
+   return gMQTTWriteQueues[pSocketID]["bytes"]
+end __queuedBytes
+
+-- ========================================
+-- THE OUTBOUND QUEUE (asynchronous writes)
+-- ========================================
+--
+-- WHY A QUEUE AND NOT JUST AN ASYNC WRITE. Ten engine runs established that a
+-- synchronous write which outruns the link stalls and loses the rest of the
+-- packet (docs/ENGINE-NOTES.md 1.1); the workaround was a fixed pause per
+-- chunk, which works and throws away most of a fast link. The engine will
+-- instead TELL US when a write has completed, and a chunk started only on that
+-- report cannot outrun anything: the queue drains at exactly the rate the
+-- socket accepts. No pause, no guess, no ceiling.
+--
+-- ORDER IS THE WHOLE RISK, and it is why every packet goes through here rather
+-- than only the big ones. A PINGREQ written directly while a megabyte of
+-- PUBLISH sat half-queued would land in the middle of that publish and
+-- desynchronise the stream permanently - the exact corruption this library has
+-- spent ten runs learning to avoid. One queue per socket, strictly FIFO, means
+-- a packet handed over later is written later. There is no direct path.
+--
+-- The queue lives in its own global rather than in the connection record, for
+-- the reason the write lock does: application code running during a callback
+-- can call mqttCleanupAll, and writing a key back into a deleted record would
+-- recreate it as a zombie the keep-alive sweep walks forever.
+--
+--   head/tail  integer bounds; the queue is EMPTY when head > tail
+--   pos        1-based byte offset into the head item, for chunking
+--   bytes      what is still owed to the socket, for backpressure and for
+--              mqttGetQueuedBytes
+--   busy       true while one chunk is in flight and unacknowledged
+private function __enqueueWrite pSocketID, pPacket
+   local tTotal, tTail
+   put the number of bytes of pPacket into tTotal
+   if tTotal is 0 then
+      return empty
+   end if
+
+   if not __isSocketOpen(pSocketID) then
+      return "the socket is not open"
+   end if
+
+   -- BACKPRESSURE. Without it an application that publishes faster than its
+   -- link can carry grows this queue until the engine runs out of memory, and
+   -- the failure lands nowhere near the cause. The receive ceiling guards the
+   -- inbound direction; the same number guards this one.
+   if __queuedBytes(pSocketID) + tTotal > __maxBufferSize() then
+      return "the outbound queue is full:" && __queuedBytes(pSocketID) \
+            && "bytes are still waiting and the limit is" && __maxBufferSize()
+   end if
+
+   if gMQTTWriteQueues[pSocketID]["tail"] is not a number then
+      put 1 into gMQTTWriteQueues[pSocketID]["head"]
+      put 0 into gMQTTWriteQueues[pSocketID]["tail"]
+      put 1 into gMQTTWriteQueues[pSocketID]["pos"]
+      put 0 into gMQTTWriteQueues[pSocketID]["bytes"]
+      put 0 into gMQTTWriteQueues[pSocketID]["inflight"]
+      put false into gMQTTWriteQueues[pSocketID]["busy"]
+   end if
+
+   add 1 to gMQTTWriteQueues[pSocketID]["tail"]
+   put gMQTTWriteQueues[pSocketID]["tail"] into tTail
+   put pPacket into gMQTTWriteQueues[pSocketID]["items"][tTail]
+   add tTotal to gMQTTWriteQueues[pSocketID]["bytes"]
+
+   __pumpWriteQueue pSocketID
+   return empty
+end __enqueueWrite
+
+-- Start the next chunk, if there is one and nothing is already in flight.
+-- Called on every enqueue and on every completion; those are the only two
+-- moments at which the queue can become runnable.
+private command __pumpWriteQueue pSocketID
+   local tHead, tTail, tItem, tPos, tEnd, tErr
+
+   if gMQTTWriteQueues[pSocketID] is empty then
+      exit __pumpWriteQueue
+   end if
+   if gMQTTWriteQueues[pSocketID]["busy"] is true then
+      exit __pumpWriteQueue
+   end if
+
+   put gMQTTWriteQueues[pSocketID]["head"] into tHead
+   put gMQTTWriteQueues[pSocketID]["tail"] into tTail
+   if tHead > tTail then
+      exit __pumpWriteQueue
+   end if
+
+   -- The socket can go while bytes are still owed to it: a disconnect from a
+   -- callback, a broker that dropped us. Writing the rest of a packet into a
+   -- socket that has been replaced is how a reconnected connection inherits a
+   -- corrupt stream.
+   if not __isSocketOpen(pSocketID) then
+      __dropWriteQueue pSocketID
+      exit __pumpWriteQueue
+   end if
+
+   put gMQTTWriteQueues[pSocketID]["items"][tHead] into tItem
+   put gMQTTWriteQueues[pSocketID]["pos"] into tPos
+   put min(tPos + __writeChunkSize() - 1, the number of bytes of tItem) into tEnd
+
+   -- RECORD THE SIZE, do not let the completion recompute it. The completion
+   -- runs a turn of the event loop later, and mqttSetWriteChunkSize can be
+   -- called in between - by application code in a message callback, which is
+   -- exactly the window. A completion that advanced by the NEW chunk size
+   -- would leave `pos` pointing at the wrong byte and write the rest of the
+   -- packet from the wrong offset: a corrupt stream, arrived at silently.
+   put true into gMQTTWriteQueues[pSocketID]["busy"]
+   put (tEnd - tPos + 1) into gMQTTWriteQueues[pSocketID]["inflight"]
+   put __writeSocketAsync(pSocketID, byte tPos to tEnd of tItem) into tErr
+   if tErr is not empty then
+      put false into gMQTTWriteQueues[pSocketID]["busy"]
+      __dropWriteQueue pSocketID
+      get __failWrite(pSocketID, "queued packet", tErr)
+   end if
+end __pumpWriteQueue
+
+-- The engine's report that one chunk is on its way. NOT an engine message
+-- name: this library chose it, in `write ... with message` below, so unlike
+-- socketClosed and its siblings nothing else is listening for it and there is
+-- nothing to pass on.
+--
+-- It must be an `on` handler and it cannot be private, or the engine cannot
+-- deliver it.
+on mqttSocketWriteDone pSocketID
+   local tHead, tTail, tItem, tPos, tSent
+
+   if gMQTTWriteQueues[pSocketID] is empty then
+      exit mqttSocketWriteDone
+   end if
+
+   put false into gMQTTWriteQueues[pSocketID]["busy"]
+
+   put gMQTTWriteQueues[pSocketID]["head"] into tHead
+   put gMQTTWriteQueues[pSocketID]["tail"] into tTail
+   if tHead > tTail then
+      -- A completion for a queue that has already been emptied or dropped.
+      exit mqttSocketWriteDone
+   end if
+
+   put gMQTTWriteQueues[pSocketID]["items"][tHead] into tItem
+   put gMQTTWriteQueues[pSocketID]["pos"] into tPos
+
+   -- What the pump actually wrote, not what the chunk size says now.
+   put gMQTTWriteQueues[pSocketID]["inflight"] into tSent
+   if tSent is not a number or tSent < 1 then
+      exit mqttSocketWriteDone
+   end if
+   put 0 into gMQTTWriteQueues[pSocketID]["inflight"]
+
+   subtract tSent from gMQTTWriteQueues[pSocketID]["bytes"]
+   add tSent to tPos
+
+   if tPos > the number of bytes of tItem then
+      -- That packet is fully written. Free it: a queue that held a megabyte
+      -- should not go on holding it.
+      delete variable gMQTTWriteQueues[pSocketID]["items"][tHead]
+      add 1 to gMQTTWriteQueues[pSocketID]["head"]
+      put 1 into gMQTTWriteQueues[pSocketID]["pos"]
+   else
+      put tPos into gMQTTWriteQueues[pSocketID]["pos"]
+   end if
+
+   __pumpWriteQueue pSocketID
+end mqttSocketWriteDone
+
+-- Returns empty on success, or the error text. Asynchronous writes still fail
+-- SYNCHRONOUSLY at the point of initiation - a closed socket, a bad id - and
+-- LiveCode reports that in `the result` rather than by throwing, which is the
+-- lesson the whole write path is built around.
+private function __writeSocketAsync pSocketID, pBytes
+   local tError, tRes
+   try
+      write pBytes to socket pSocketID with message "mqttSocketWriteDone"
+   catch tError
+      return tError
+   end try
+
+   put the result into tRes
+   if tRes is not empty then
+      return tRes
+   end if
+   return empty
+end __writeSocketAsync
+
+-- Forget what a socket still owed. Called on every teardown, and before a
+-- synchronous DISCONNECT so that queued bytes cannot be written after it.
+private command __dropWriteQueue pSocketID
+   local tPending
+   if gMQTTWriteQueues[pSocketID] is empty then
+      exit __dropWriteQueue
+   end if
+
+   put __queuedBytes(pSocketID) into tPending
+   if tPending > 0 then
+      __mqttLog "Discarding" && tPending && "queued bytes for" && pSocketID \
+            && "- they were never written"
+   end if
+   delete variable gMQTTWriteQueues[pSocketID]
+end __dropWriteQueue
+
+private function __writeSocketSync pSocketID, pPacket
    -- CHUNKED, AND IT YIELDS BETWEEN CHUNKS. The yield is the part that took
    -- seven engine runs to find; the chunking on its own does not fix anything.
    --
@@ -1555,10 +1878,7 @@ private function __writeSocket pSocketID, pPacket
       return empty
    end if
 
-   put gMQTTWriteChunkSize into tChunkSize
-   if tChunkSize is not a number or tChunkSize < 512 then
-      put 16384 into tChunkSize
-   end if
+   put __writeChunkSize() into tChunkSize
 
    -- One chunk: the old path exactly, with no yield and no lock. Raising
    -- gMQTTWriteChunkSize above your largest payload restores the pre-2.12.6
@@ -1623,7 +1943,7 @@ private function __writeSocket pSocketID, pPacket
    __mqttDebug "Wrote" && tTotal && "bytes in" && (tYields + 1) && \
          "chunks with" && tYields && "yields"
    return empty
-end __writeSocket
+end __writeSocketSync
 
 -- A FAILED WRITE CORRUPTS THE STREAM, NOT JUST THE PACKET, so the only safe
 -- response is to reset the connection - which is what this does, and what
@@ -1820,7 +2140,7 @@ end __maxBufferSize
 -- depend on a host having called an initialiser.
 private function __writeYieldMs
    if gMQTTWriteYieldMs is not a number or gMQTTWriteYieldMs < 0 then
-      return 0
+      return 50
    end if
    return gMQTTWriteYieldMs
 end __writeYieldMs

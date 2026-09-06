@@ -1,21 +1,25 @@
 # MQTT Client Library Reference
 
-Version 2.12.7 - OXT MQTT 3.1.1 Implementation
+Version 2.13.0 - OXT MQTT 3.1.1 Implementation
 
-> **Status: eight engine runs recorded 2026-09-05/06.** Compiles and loads on
-> OXT; connects to mosquitto and hivemq, in the clear and over verified TLS; QoS
-> 0/1/2, UTF-8 and binary payloads, retained, unsubscribe, keep-alive and the
-> auto-reconnect back-off are observed working, and payloads to 1 MB round-trip
-> over the internet path.
+> **Status: fourteen engine runs recorded 2026-09-05/06, the best one 17 passed,
+> 0 failed.** Compiles and loads on OXT; connects to mosquitto and hivemq, in the
+> clear and over verified TLS. Observed working: QoS 0/1/2 with their
+> acknowledgment legs and exactly-once, UTF-8 and binary payloads, zero-length
+> payloads, retained replay and clear, unsubscribe, keep-alive over 100 s idle,
+> **two simultaneous connections with independent keep-alive chains**, the
+> auto-reconnect back-off, and payloads to 1 MB on two brokers over two networks.
 >
-> **One open defect, cause now isolated:** a **plaintext** publish beyond roughly
-> 64 KB to 400 KB (the point moves with the network path) can stall and reset the
-> connection. Observed against two brokers on two networks in one run, while the
-> same engine carried the same megabyte to one of them over TLS. **TLS is
-> unaffected; use it, or keep plaintext publishes small.** The fix is not settled
-> yet — see `docs/ENGINE-NOTES.md` 1.1. Not yet observed either: a reconnect that
-> succeeds, two connections at once, the persistent store, and certificate
-> verification refusing a bad certificate.
+> **Writes are asynchronous as of 2.13.0** - queued per connection and written a
+> chunk at a time as the engine reports each one done, which paces them at the
+> link's own rate. `mqttPublish` returning "OK" therefore means QUEUED; the
+> acknowledgment is what proves delivery. `mqttSetAsyncWrites false` falls back
+> to the paced synchronous path of 2.12.8. **This path has not yet run on an
+> engine** - `docs/ENGINE-NOTES.md` section 4 has the design, the risk it
+> carries, and what a run has to show.
+>
+> **Not yet observed:** a reconnect that succeeds, the persistent store, and
+> certificate verification refusing a bad certificate.
 
 ## Table of Contents
 
@@ -320,34 +324,124 @@ mqttSetWriteYieldMs pMilliseconds
 **Zero is not "no pause".** It is a yield: one turn of the engine's event loop,
 costing pending messages their run and no elapsed time.
 
-**A non-zero value is the current workaround for the large plaintext write
-stall.** The engine's plaintext write hands the kernel one non-blocking send and
-does not retry a socket that is momentarily full, so writing chunks back to back
-at zero pause fills the send buffer faster than the wire drains it and the first
-chunk to meet a full buffer times out (`docs/ENGINE-NOTES.md` 1.1). A pause
-gives the buffer time to drain. It costs the given delay per chunk, so a 1 MB
-payload at 16 KB chunks and 20 ms adds 1.3 seconds.
+**This is a rate limit, and it is what makes a large publish work at all.** The
+engine's plaintext write hands the kernel one non-blocking send and does not
+retry a socket that is momentarily full, so chunks written back to back fill the
+send buffer faster than the wire drains it and the first chunk to meet a full
+buffer times out with the packet half-sent (`docs/ENGINE-NOTES.md` 1.1, ten
+engine runs). The pause keeps the write inside the link's drain rate.
 
-**How much you need depends on your uplink**, which is why there is no
-non-zero default yet. Raise it until your largest publish goes through. TLS
-connections do not need it at all.
+**The arithmetic is chunk ÷ pause.** At the defaults, 16384 bytes per 50 ms =
+320 KB/s. Raise the pause to be safer on a slow uplink; lower it to go faster,
+until it outruns the link and fails. A measured example: a broker over a home
+internet connection stalled at 0, 5 and 20 ms and carried a megabyte at 50.
+
+**Ordinary traffic pays nothing.** A packet that fits one chunk never pauses —
+every control packet, and almost every publish. This only governs payloads
+larger than `mqttGetWriteChunkSize()`.
+
+**To tune it for your own path**, run `examples/mqtt-conformance-button`: its
+first stage ladders the pause upward and reports the fastest value that carries
+a megabyte.
 
 **Example:**
 ```OXT
-mqttSetWriteYieldMs 20   -- then retry the publish that stalled
+mqttSetWriteYieldMs 5    -- a fast LAN: 16384 / 5ms = 3.2 MB/s
+mqttSetWriteYieldMs 200  -- a slow uplink: 80 KB/s, but it gets there
 ```
 
 ---
 
 ### mqttGetWriteYieldMs
 
-Get the current inter-chunk yield in milliseconds.
+Get the current inter-chunk yield in milliseconds. Only consulted when
+asynchronous writes are off.
 
 ```OXT
 put mqttGetWriteYieldMs() into tMs
 ```
 
 **Returns:** Integer
+
+---
+
+### mqttSetAsyncWrites
+
+Choose how packets reach the socket. Asynchronous is the default.
+
+```OXT
+mqttSetAsyncWrites pEnabled
+```
+
+**Parameters:**
+- `pEnabled` - `true` (default) for the outbound queue, `false` for the paced
+  synchronous path of 2.12.8
+
+**Asynchronous (the default).** A packet is appended to a per-connection queue
+and written one chunk at a time, each chunk started only when the engine reports
+the previous one written. The queue drains at exactly the rate the socket
+accepts — no pause to guess at, and no ceiling. Ordering is guaranteed because
+*every* packet goes through the queue: a control packet can never overtake a
+publish that is half-written.
+
+**What it changes for you:** `mqttPublish` returning `"OK"` means the packet is
+**queued**, not that its bytes are on the wire. A write that fails after that
+point cannot be returned to you, so it arrives the way any mid-connection
+failure does — the state-change callback with `disconnected` and a reason. For
+QoS 1 and 2 the acknowledgment is the real proof of delivery, and always was.
+
+**Synchronous (`false`).** The pre-2.13.0 path: chunks written back to back with
+`mqttSetWriteYieldMs` between them. Slower for large payloads and it blocks the
+engine while it runs, but a write failure comes straight back from
+`mqttPublish`. Use it if you depend on that, or as the way back if asynchronous
+writes misbehave on your engine.
+
+`DISCONNECT` is written synchronously either way — a queued one would be
+discarded by the socket close that follows it, and the broker would publish the
+Last Will on a clean exit.
+
+**Example:**
+```OXT
+mqttSetAsyncWrites false   -- back to the 2.12.8 paced path
+```
+
+---
+
+### mqttGetAsyncWrites
+
+Whether writes are asynchronous.
+
+```OXT
+put mqttGetAsyncWrites() into tAsync
+```
+
+**Returns:** `true` or `false`
+
+---
+
+### mqttGetQueuedBytes
+
+How many bytes are queued for a connection and not yet written.
+
+```OXT
+put mqttGetQueuedBytes(pHost, pPort) into tBytes
+```
+
+**Returns:** Integer; `0` when everything handed to the library has reached the
+socket, and always `0` under synchronous writes.
+
+**Use it to pace an application that produces faster than its link can carry.**
+A packet that would take the queue past `mqttSetMaxBufferSize` is refused
+outright, so a producer that ignores this will eventually see
+`ERROR: the outbound queue is full`.
+
+**Example:**
+```OXT
+if mqttGetQueuedBytes(tHost, tPort) > 1048576 then
+   -- let the link catch up before adding more
+   exit publishNextFrame
+end if
+```
 
 ---
 
@@ -929,7 +1023,7 @@ function mqttTestLibrary()
 **Example:**
 ```OXT
 put mqttTestLibrary()
--- Returns: "MQTT Library v2.12.7 loaded successfully"
+-- Returns: "MQTT Library v2.13.0 loaded successfully"
 ```
 
 ---

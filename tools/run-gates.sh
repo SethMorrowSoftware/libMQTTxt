@@ -35,6 +35,7 @@ run "gate discrimination: demo"     python3 tools/test-demo-gates.py
 # --- the library --------------------------------------------------------------
 run "library static gate"           python3 tools/check-libmqttxt.py
 run "MQTT 3.1.1 protocol vectors"   python3 tools/test-mqtt-vectors.py
+run "outbound queue keeps order"    python3 tools/test-write-queue.py
 
 # --- the demo -----------------------------------------------------------------
 run "embedded library is current"   python3 tools/sync-demo-embeds.py --check

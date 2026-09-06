@@ -114,10 +114,18 @@ CASES = [
         # The realistic version of this mistake: somebody makes an existing
         # wait "keep the UI responsive" and silently makes the reconnect path
         # re-entrant.
-        "a re-entrant yield outside __writeSocket",
+        "a re-entrant yield outside __writeSocketSync",
         lambda s: mutate(s, "         wait 100 milliseconds",
                          "         wait 100 milliseconds with messages"),
         "can re-enter the library",
+    ),
+    (
+        # The realistic version of THIS one: a PINGREQ "does not need to wait
+        # in a queue behind a big publish", which is exactly backwards.
+        "an asynchronous write that bypasses the queue",
+        lambda s: mutate(s, "      return __enqueueWrite(pSocketID, pPacket)",
+                         "      return __writeSocketAsync(pSocketID, pPacket)"),
+        "Only __pumpWriteQueue may start an asynchronous write",
     ),
 ]
 

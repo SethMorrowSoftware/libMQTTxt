@@ -55,6 +55,14 @@ jobs:
       - name: MQTT 3.1.1 protocol vectors
         run: python3 tools/test-mqtt-vectors.py
 
+      # The asynchronous write path rests on one property: the bytes reaching
+      # the socket are the packets, in the order they were handed over. Break
+      # it and a PINGREQ lands inside a half-written PUBLISH with no error on
+      # either side. The queue's state machine is transcribed and driven
+      # through the sequences that would break it.
+      - name: outbound queue keeps order
+        run: python3 tools/test-write-queue.py
+
       # --- the demo ---------------------------------------------------------
       # The demo carries the library, the UI kit and the boot self-check. Each
       # copy has a gate holding it identical to its master, because a demo that

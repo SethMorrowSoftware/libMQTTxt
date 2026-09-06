@@ -433,26 +433,35 @@ over the internet — while the same engine had carried that same megabyte to th
 same broker over TLS without a pause. Two brokers, two networks, one variable:
 plaintext.
 
-**The known limitation, stated plainly.** A plaintext publish beyond roughly
-64 KB to 400 KB — the exact point moves with the network path — can stall and
-reset the connection. The library detects it, reports how many bytes went out,
-and tears the connection down rather than leaving a corrupt stream, but the
-publish does not go through. **TLS is unaffected.** If you need large payloads
-today, use TLS, or keep publishes small.
-
 The reading that fits every measurement: the engine's plaintext write hands the
 kernel one non-blocking send and does not retry a socket that is momentarily
 full. Chunking never addressed that, because chunks written back to back cost no
-elapsed time — the send buffer fills faster than the wire drains it. The stall
-points are simply how much fitted first, which is why they track the network
-path rather than the payload size.
+elapsed time — the send buffer fills faster than the wire drains it.
 
-**Still unproven:** the fix. The conformance button now measures the smallest
-per-chunk pause at which a megabyte gets through, which decides between a paced
-default and asynchronous writes. Also unproven: a reconnect that *succeeds* and
-resubscribes; multi-connection; the persistent store; and certificate
-verification rejecting a bad certificate. The performance figures below are from
-2.11.x and have not been re-measured.
+**The tenth run proved the cure and measured it.** A pacing ladder published a
+megabyte at 0, 5, 20 and 50 ms per chunk: the first three stalled at exactly
+65536 bytes and 50 ms carried it. Keeping that pause, **the whole conformance run
+then went green against the LAN broker — 16 passed, 0 failed** — with the size
+ladder to 1 MB, retained replay, unsubscribe and 100 s of keep-alive included.
+That is the first fully green run of the project. Pacing is now the default.
+
+**What it costs:** a multi-chunk write is capped at chunk ÷ pause = 320 KB/s,
+and the run's timings show 94–96% of a large write's elapsed time is the pause
+rather than the network. Payloads that fit one chunk are unaffected. Tune it for
+your own path with the conformance button, or wait for asynchronous writes,
+which would pace themselves.
+
+**An eleventh session then ran the last untested stage.** Two simultaneous
+connections to one broker — reached by two spellings of its address, since the
+library keys a connection by `host:port` — were held idle for 100 s at *different*
+keep-alive intervals, 30 s against 60 s, and both survived with their own
+PINGRESPs. That is the 2.12.0 timer-token work proved on an engine: before it, a
+single delayed message served every connection and whichever timer fired first
+pinged both. The best run of the project is **17 passed, 0 failed, 1 skipped.**
+
+**Still unproven:** a reconnect that *succeeds* and resubscribes; the persistent
+store; and certificate verification rejecting a bad certificate. The performance
+figures below are from 2.11.x and have not been re-measured.
 
 ## Performance
 
@@ -523,7 +532,67 @@ MQTT 3.1.1 Specification Implementation:
 
 ## Version History
 
-### 2.12.7 (Current)
+### 2.13.0 (Current)
+
+**Writes are asynchronous.** The fix that runs 7 through 10 pointed at, built.
+
+- **Every packet goes through a per-connection outbound queue**, written one
+  chunk at a time, each chunk started only when the engine reports the previous
+  one done. That is self-pacing: the queue drains at exactly the rate the socket
+  accepts, with no delay to guess at. It replaces the fixed 50 ms pause that
+  worked but capped large writes at 320 KB/s while the real write work for a
+  megabyte was ~139 ms.
+- **Every packet, not just the large ones**, because that is what makes it safe.
+  A PINGREQ written directly while a megabyte of PUBLISH sat half-queued would
+  land *inside* that publish and desynchronise the broker's framing for good.
+  One queue per socket, strictly FIFO, one chunk in flight — there is no direct
+  path, and a static gate enforces that only the pump may start a write.
+- **`mqttPublish` returning `OK` now means queued, not written.** A failure
+  after that point arrives through the state-change callback with
+  `disconnected` and a reason. For QoS 1 and 2 the acknowledgment was always the
+  real proof of delivery. `mqttGetQueuedBytes` reports what is still owed.
+- **Backpressure:** a packet that would take the queue past the buffer ceiling
+  is refused, rather than growing it until the engine runs out of memory.
+- **`DISCONNECT` is still written synchronously**, after dropping the queue. A
+  queued one would be discarded by the `close socket` on the next line and every
+  clean disconnect would fire the Last Will.
+- **`mqttSetAsyncWrites false`** falls back to the 2.12.8 paced synchronous path
+  in one line — the way back if this misbehaves on your engine.
+- **New gate:** `tools/test-write-queue.py` transcribes the queue's state
+  machine and drives it through the sequences that would break ordering —
+  interleaved enqueues, an enqueue arriving during a write, a chunk-size change
+  mid-flight, a socket closing mid-packet. That last-but-one case caught a real
+  defect in the first draft before it ever ran.
+
+**Not yet run on an engine.** Verified statically; needs an OXT pass.
+
+### 2.12.8
+
+From the tenth engine run — **the first fully green conformance run: 16 passed,
+0 failed.**
+
+- **Large writes are paced by default.** The pacing ladder measured it: 0, 5 and
+  20 ms per chunk all stalled at exactly 65536 bytes against a broker over the
+  internet, and 50 ms carried a megabyte. The stall point is the path's send
+  buffer; the pause decides whether the write ever drives into it. So
+  `gMQTTWriteYieldMs` now defaults to 50, and a large publish works out of the
+  box instead of resetting the connection.
+- **Ordinary traffic pays nothing.** A packet that fits one chunk never pauses —
+  every control packet and almost every publish. This only governs payloads
+  larger than the chunk size.
+- **The cost, stated honestly:** a multi-chunk write is capped at
+  chunk ÷ pause = 320 KB/s. The run's own timings show 94–96% of the elapsed
+  time on large payloads is the pause; the real write work for a megabyte was
+  139 ms. On a fast LAN that is an order of magnitude left on the table. Lower
+  the pause (or raise the chunk size) once you have measured your own path — the
+  conformance button's first stage does exactly that and reports the fastest
+  value that works.
+- Asynchronous writes are the identified real fix, since the engine reports each
+  chunk as it is actually written and so paces itself at the link's true rate.
+  Not built: it needs an outbound queue per connection and changes what
+  `mqttPublish` returning `OK` means. See `docs/ENGINE-NOTES.md` 1.1.
+
+### 2.12.7
 
 From the eighth and ninth engine runs. The eighth refuted the 2.12.6 diagnosis;
 **the ninth found the cause by controlled comparison.**
