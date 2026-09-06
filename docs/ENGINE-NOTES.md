@@ -343,6 +343,61 @@ line whether the broker is refusing the packet, hitting a limit, or simply not
 being handed the bytes. That is a cheaper answer than any further inference from
 this side, and it is the next thing to do.
 
+### The ninth run: it is the engine's plaintext write, and no broker is involved
+**OBSERVED 2026-09-06.** The probe ran. The same 1 MB publish, in the clear,
+stalled against BOTH brokers in one run:
+
+    broker                       written before the stall   of
+    broker.hivemq.com:1883        65536  (4 chunks)         1048615
+    192.168.1.104:1883           442368  (27 chunks)        1048619
+
+Two brokers. Two networks - one LAN, one internet. Both plaintext. Both stall
+after the socket timeout with the connection reset. **And the same engine, in
+run 6, carried a megabyte to broker.hivemq.com over TLS in 117 ms.**
+
+**So the broker is not the variable and the network is not the variable.
+Plaintext is.** `message_size_limit` and every other broker-side explanation is
+dead: hivemq's public broker and a local mosquitto do not share a limit, and
+neither refuses a megabyte over TLS. This is the strongest result of the whole
+investigation because it is a controlled comparison rather than an inference:
+one variable changed, the failure followed it.
+
+**The mechanism, and note that it is the ORIGINAL reading with the piece that
+was missing.** The engine's plaintext write does one non-blocking send and does
+not retry a socket that is momentarily full. v2.12.3 got that right and then
+drew the wrong conclusion from it: chunking does not help, because chunks
+written back to back **cost no elapsed time**. A yield of zero returns the loop
+its turn and returns instantly, so the kernel's send buffer is filled far faster
+than the wire drains it, and the first chunk that meets a full buffer times out.
+Run 7's "six chunks then a wall" was never evidence against the send buffer - it
+was the buffer filling in six chunks.
+
+The byte counts are then simply how much fitted before that happened, which
+explains every number this investigation has produced: they move with the path
+(65536 over a slow internet link, 442368 on a LAN with a bigger autotuned
+buffer), they move between runs on one path (autotuning), and they have no
+relation to the payload size. TLS escapes it because the engine's TLS write goes
+through a different path that does loop until the data is accepted.
+
+Evidence class: the plaintext-versus-TLS split is **OBSERVED** - a controlled
+comparison across two brokers. The send-and-do-not-retry mechanism inside the
+engine remains **INFERRED**; it is the only reading left that fits, but nobody
+here has read the engine's source.
+
+**What v2.12.7's probe becomes (the pacing ladder).** If the cause is that we
+write faster than the wire drains, the cure is to write slower, and the question
+is only how much slower. The stage now republishes the same megabyte at an
+increasing pause per chunk - 0, 5, 20, 50 ms - on a fresh connection each time,
+and reports the smallest pause that gets a megabyte through. **A pause that
+works stays set for the rest of the run**, so the ladder against the broker
+under test becomes an independent second test of the same answer.
+
+That measurement is what a real fix needs. A fixed pause cannot be right for
+every path (a fast LAN wastes it; a slow uplink needs more), so the answer this
+produces decides between a paced default and asynchronous writes, which
+self-pace because the engine reports each chunk as it goes. Async is now the
+favourite for the eventual fix; the pacing number tells us how much it is worth.
+
 ### 1.4 A DISCONNECT written just before `close socket` may not reach the broker
 **INFERRED (2026-09-06), not yet observed, recorded so it is not lost.**
 
@@ -736,6 +791,33 @@ either (2.1). Two stacks, two sessions, same shape.
 chunks, under a re-entrancy lock, and the conformance run gets a stage that
 publishes 1 MB to a topic nothing echoes back - the experiment that tells the
 echo stall apart from a broken write path. Both are in the next run.
+
+### Ninth run, 2026-09-06, OXT + mosquitto AND broker.hivemq.com, both :1883, v2.12.7
+
+9 passed, 3 failed - and the three failures are one finding, which is the
+finding this investigation was looking for. **A large plaintext write stalls
+against two different brokers on two different networks, while TLS to one of
+those brokers carries the same megabyte fine** (1.1). The variable is plaintext,
+not the broker, not the LAN, not the echo, not the payload size.
+
+**Newly OBSERVED:**
+
+- **The controlled comparison itself.** Nothing else in this project has
+  isolated a cause this cleanly: same engine, same payload, same run, two
+  brokers, one variable.
+- **The boot self-check green again, 14 of 14**, on a reopened stack - twice
+  running now, so 2.1 stays closed.
+- **`mqttSelfTest` inside the engine: 9 passed, 0 failed** at 2.12.7, printed
+  from the demo's button.
+- **The write-path failure is clean every time.** Five runs of `__failWrite` now:
+  the byte count is reported, the connection is reset rather than left holding a
+  half-packet, and the run aborts instead of printing unearned passes.
+
+**What v2.12.7 leaves for the tenth run:** the probe becomes a pacing ladder
+(0, 5, 20, 50 ms per chunk) that measures the smallest pause a megabyte needs,
+and keeps a working pause set for the rest of the run so the ladder retests it.
+The mechanism says pacing should work; the number decides whether a paced
+default or asynchronous writes is the fix worth building.
 
 ### Eighth run, 2026-09-06, OXT + mosquitto 192.168.1.104:1883, v2.12.6
 
