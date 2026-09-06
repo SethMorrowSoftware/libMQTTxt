@@ -79,6 +79,7 @@ global gMQTTKeepAliveThreshold    -- When to send PINGREQ (0-1, default 0.75 = 7
 global gMQTTTimerTokens           -- Maps a numeric timer token to its connection ID
 global gMQTTTimerSeq              -- Monotonic counter that mints timer tokens
 global gMQTTWriteChunkSize        -- Largest single write handed to the kernel (bytes)
+global gMQTTInitialized           -- true once mqttInitialize has run in this engine session
 
 -- ========================================
 -- LIBRARY INITIALIZATION
@@ -142,6 +143,8 @@ command mqttInitialize
    if gMQTTWriteChunkSize is empty then
       put 16384 into gMQTTWriteChunkSize
    end if
+
+   put true into gMQTTInitialized
 end mqttInitialize
 
 on libraryStack
@@ -288,6 +291,10 @@ end mqttSetPersistentStore
 -- ========================================
 
 function mqttConnect pHost, pPort, pClientID, pUsername, pPassword, pKeepAlive, pUseTLS, pCleanSession, pLWTTopic, pLWTMessage, pLWTQoS, pLWTRetain, pVerifyTLS, pAutoReconnect, pCACertPath
+   -- Whatever the host did or did not do at open time, nothing below runs
+   -- against empty globals. See __ensureInit for the run that made this rule.
+   __ensureInit
+
    -- Validate the address BEFORE it is used to key anything: every table in this
    -- library is indexed by "host:port", so an empty host would mint the key
    -- ":1883" and quietly alias every other portless caller onto one record.
@@ -906,7 +913,7 @@ command mqttCleanupAll
 end mqttCleanupAll
 
 function mqttTestLibrary
-   return "MQTT Library v2.12.3 loaded successfully"
+   return "MQTT Library v2.12.4 loaded successfully"
 end mqttTestLibrary
 
 function mqttSelfTest
@@ -1039,7 +1046,7 @@ function mqttSelfTest
    -- Summary
    put "MQTT Library Self-Test" & return into tResults
    put "=====================" & return after tResults
-   put "Version: 2.12.3" & return after tResults
+   put "Version: 2.12.4" & return after tResults
    put "Passed:" && tPassed & return after tResults
    put "Failed:" && tFailed & return after tResults
 
@@ -1700,6 +1707,34 @@ end __captureCallbackTarget
 -- The PINGREQ threshold, guarded. libraryStack sets the global, but a handler
 -- reached before initialisation would otherwise multiply by empty - which is
 -- zero, and a zero threshold means "ping constantly".
+-- THE LIBRARY INITIALISES ITSELF BEFORE IT TOUCHES THE NETWORK.
+--
+-- Fifth engine run, 2026-09-06: a fresh engine session opened the demo and its
+-- boot self-check reported the keep-alive threshold EMPTY - the embedding
+-- stack's preOpenStack had not initialised the library. Every earlier run had
+-- inherited populated globals from a standalone-library session in the same
+-- engine, so the embedded initialisation path had never actually been
+-- exercised. Had that connection succeeded, the first inbound byte would have
+-- met `the number of bytes of tBuffer > gMQTTMaxBufferSize` with an EMPTY
+-- limit - a string comparison that is always true - and been torn down as a
+-- buffer overflow. A library must not have a failure mode that depends on the
+-- host calling one line in one specific handler; this is the backstop.
+private command __ensureInit
+   if gMQTTInitialized is not true then
+      mqttInitialize
+   end if
+end __ensureInit
+
+-- The receive-buffer ceiling, guarded like the keep-alive threshold below and
+-- for the same reason: an empty global compares as text, and "always true" on
+-- an overflow check tears down every connection on its first byte.
+private function __maxBufferSize
+   if gMQTTMaxBufferSize is not a number or gMQTTMaxBufferSize < 1 then
+      return 5242880
+   end if
+   return gMQTTMaxBufferSize
+end __maxBufferSize
+
 private function __keepAliveThreshold
    if gMQTTKeepAliveThreshold is not a number then
       return 0.75
@@ -2464,7 +2499,7 @@ private command __parseIncomingData pConnID, pData
    put gMQTTConnections[pConnID]["receiveBuffer"] into tBuffer
 
    -- Buffer overflow protection
-   if the number of bytes of tBuffer > gMQTTMaxBufferSize then
+   if the number of bytes of tBuffer > __maxBufferSize() then
       __mqttLog "CRITICAL: Buffer overflow (" & the number of bytes of tBuffer && "bytes)"
       __cleanupConnection pConnID, "buffer overflow"
       __handleReconnect pConnID
@@ -2499,9 +2534,9 @@ private command __parseIncomingData pConnID, pData
       -- after buffering it. The overflow guard above only fires once the bytes
       -- have actually arrived, so a broker (or anything posing as one)
       -- announcing a 256 MB packet could hold the buffer growing until then.
-      if tPacketSize > gMQTTMaxBufferSize then
+      if tPacketSize > __maxBufferSize() then
          __mqttLog "CRITICAL: Declared packet size" && tPacketSize && \
-               "exceeds buffer limit" && gMQTTMaxBufferSize
+               "exceeds buffer limit" && __maxBufferSize()
          __cleanupConnection pConnID, "oversized packet"
          __handleReconnect pConnID
          exit __parseIncomingData
@@ -3428,6 +3463,7 @@ local sVerify           -- "true" when the verify-certificate checkbox is ticked
 local sAuto             -- "true" when auto-reconnect is ticked
 local sRetain           -- "true" when the publish retain checkbox is ticked
 local sRecv             -- messages delivered to mdOnMessage this session
+local sPreOpenRan       -- "true" once preOpenStack has fired; the boot check reads it
 
 -- ==== SUITE UI KIT v2 BEGIN (verbatim copy; master: tools/ui-kit.livecodescript; gate: tools/check-ui-kit-drift.py) ====
 -- The family look as one carried block: the kit owns colors, chrome, and
@@ -3877,6 +3913,7 @@ end uiMenuSource
 
 on preOpenStack
    -- THE ONE LINE AN EMBEDDING STACK OWES THE LIBRARY. See the header.
+   put "true" into sPreOpenRan
    mqttInitialize
 end preOpenStack
 
@@ -4025,6 +4062,16 @@ end mdClearGeneratedUI
 -- ---- start / stop -----------------------------------------------------------
 
 command mdStart
+   -- AGAIN, on purpose. The fifth engine run (2026-09-06) opened this demo on a
+   -- fresh engine and the boot check found the library uninitialised:
+   -- preOpenStack had not taken effect. Whether that was the engine or the way
+   -- the stack was opened is not established, and it does not matter here - a
+   -- demo that works only when one lifecycle message arrives is a demo that
+   -- sometimes does not work. mqttInitialize is idempotent; calling it from
+   -- the start handler as well costs nothing and closes the gap. The check
+   -- below still reports whether preOpenStack fired, as its own line.
+   mqttInitialize
+
    put false into sConnected
    put empty into sConnKey
    put 0 into sRecv
@@ -4186,6 +4233,15 @@ command mdConnectNow
    if sConnected is "true" then
       uiStatus "Already connected - disconnect first.", "warn"
       exit mdConnectNow
+   end if
+
+   -- 8883 is the conventional TLS port. Connecting to it in the clear is legal
+   -- and occasionally deliberate, but the usual outcome is a broker that
+   -- accepts the TCP connection and closes it on the first plaintext byte -
+   -- which reads in the log as a connection that simply dropped.
+   if tPort is 8883 and sTLS is not "true" then
+      mdLog "NOTE: port 8883 without TLS - if the socket closes right after " \
+            & "CONNECT, tick TLS and try again"
    end if
 
    put tHost & ":" & tPort into sConnKey
@@ -4665,8 +4721,16 @@ command mdScRun
    scAssert "the embedded libMQTTxt answers (" & scShow(tVer) & ")", \
          (tVer contains "MQTT Library")
 
+   -- Two questions the first version asked as one. On a fresh engine on
+   -- 2026-09-06 the combined line failed, and it took the log's FIRST line to
+   -- work out which half: preOpenStack had not initialised the library, and
+   -- every earlier run had passed only because globals were inherited from a
+   -- standalone-library session. Asked separately, a failure names its cause.
+   scAssert "preOpenStack fired before openStack (marker: " \
+         & scShow(sPreOpenRan) & ")", (sPreOpenRan is "true")
+
    put mqttGetKeepAliveThreshold() into tThresh
-   scAssert "mqttInitialize ran: the keep-alive threshold is set (" \
+   scAssert "the library is initialised: keep-alive threshold set (" \
          & scShow(tThresh) & ")", \
          (tThresh is a number and tThresh > 0 and tThresh <= 1)
 

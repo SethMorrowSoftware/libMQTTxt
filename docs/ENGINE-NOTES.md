@@ -237,7 +237,71 @@ asserting it on delivery.
 
 ---
 
-## 2. What a run has established
+## 2. Lifecycle
+
+### 2.1 An embedded library's preOpenStack initialisation did not take effect on a fresh engine
+**OBSERVED 2026-09-06** (the FAIL line); **cause not established.**
+
+Fifth engine run, on a stack named "Untitled 2" rather than the "Untitled 1"
+of runs one to four. The boot self-check reported:
+
+    FAIL  mqttInitialize ran: the keep-alive threshold is set (empty)
+    FAIL  the embedded library's own self-test passes
+
+Both lines are one fact: `gMQTTKeepAliveThreshold` was empty when the check ran,
+so the demo's `preOpenStack` - the handler that calls `mqttInitialize` - had not
+taken effect.
+
+**How the log proves the globals were empty at start.** Every earlier run's log
+begins `Callback target set to: stack "Untitled 1"`. This one begins `Log
+callback set to: mdOnLog`. The missing first line is `mqttSetCallbackTarget`'s,
+logged through `__mqttLog`, which stays silent while the log callback is unset.
+In runs one to four it was ALREADY set - inherited from the operator's earlier
+standalone-library session (`start using` -> `libraryStack` -> `mqttInitialize`)
+in the same engine - so the line printed. **The embedded initialisation path had
+therefore never actually run before this session; every earlier PASS on that
+assertion was inherited, not earned** (INFERRED, and the reason the assertion
+is now two lines).
+
+**Why the cause is open.** `openStack` ran (the window built, the demo started,
+the check ran), and the engine sends `preOpenStack` before `openStack` on every
+open. So either the engine did not deliver it to a script pasted into an
+already-open stack, or the stack reached `openStack` by some other route
+(re-applying a script does not re-send either message; a manual `send openStack`
+sends only that one). The operator's sequence for "Untitled 2" was not recorded.
+Either way the conclusion is the same and the fix does not depend on it.
+
+**What it would have broken.** Had the connection succeeded, the first inbound
+byte would have reached `the number of bytes of tBuffer > gMQTTMaxBufferSize`
+with an EMPTY limit. A number compared to empty is a STRING comparison in
+xTalk, and "4" > "" is true - so the CONNACK would have been torn down as a
+buffer overflow and the library could not have connected at all.
+
+**Gate / fix (v2.12.4):** the library initialises itself. `mqttConnect` calls
+`__ensureInit` (sentinel `gMQTTInitialized`), so nothing network-side ever runs
+against empty globals whatever the host did at open time; `__maxBufferSize()`
+guards the ceiling read like `__keepAliveThreshold()` already guarded its. The
+demo calls `mqttInitialize` from `mdStart` as well as `preOpenStack`, and its
+boot check asks the two questions separately: did `preOpenStack` fire (a
+script-local marker), and is the library initialised. A stack that reaches
+`openStack` without `preOpenStack` now says so in one line instead of failing
+two unrelated-looking assertions.
+
+### 2.2 The engine's `socketClosed` reaches the library
+**OBSERVED 2026-09-06.** Connecting in the clear to broker.hivemq.com:8883 - the
+TLS port - produced `Socket connected`, `CONNECT packet sent`, then
+`Socket closed: broker.hivemq.com:8883` and `Auto-reconnect disabled`. The
+broker closed the plaintext CONNECT; the engine sent `socketClosed`; the
+library's `on socketClosed` dispatched to `mqttSocketClosed`, which found the
+connection, tore it down and consulted the reconnect flag. The message that was
+never wired in 2.11.9 (this library declared `mqttSocketClosed` and nothing
+sent it) is now seen doing its job. The demo logs a hint when 8883 is used
+without TLS, because the failure otherwise reads as a connection that simply
+dropped.
+
+---
+
+## 3. What a run has established
 
 ### 2026-09-05, OXT + mosquitto (local) and broker.hivemq.com
 
@@ -301,8 +365,15 @@ rung - which is the v2.12.2 reset doing its job. The two failures are one event
 (the timed-out write) and its consequence (the abort). Nothing else regressed.
 The write timings are in 1.1 and they change the diagnosis.
 
-**Still untested:** whatever the write-path decision becomes (1.1);
-multi-connection (needs `kCtHost2` set - the library keys connections by
-`host:port`); auto-reconnect after a broker restart - the operator had it
-unticked this run, so the reset stopped at "Auto-reconnect disabled"; persistent
-store; TLS end to end (1.2).
+### Fifth run, 2026-09-06, OXT, fresh engine session, v2.12.3
+
+Boot self-check 11 passed, 2 failed - and the two failures were the boot check
+catching exactly what it exists to catch: an uninitialised embedded library on
+a fresh engine (2.1). No conformance run followed; the two connect attempts were
+to hivemq's TLS port in the clear, which the broker closed and the library
+handled correctly (2.2). The 1 MB rung of the write ladder has still not run.
+
+**Still untested:** the chunked write at 1 MB (1.1); multi-connection (needs
+`kCtHost2` set - the library keys connections by `host:port`); auto-reconnect
+after a broker restart - still unticked; persistent store; TLS end to end
+(1.2); and now the v2.12.4 initialisation backstop on a fresh engine (2.1).

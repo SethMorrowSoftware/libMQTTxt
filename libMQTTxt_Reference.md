@@ -1,12 +1,12 @@
 # MQTT Client Library Reference
 
-Version 2.12.3 - OXT MQTT 3.1.1 Implementation
+Version 2.12.4 - OXT MQTT 3.1.1 Implementation
 
 > **Status: first engine passes recorded 2026-09-05/06.** Compiles and loads on
 > OXT; connects to mosquitto and hivemq; QoS 0/1/2, UTF-8 and binary payloads,
 > retained, unsubscribe and keep-alive are observed working. The chunked write
-> path in 2.12.3 (`mqttSetWriteChunkSize`) is the current open item: designed
-> from four runs, not yet run itself. The record is `docs/ENGINE-NOTES.md`.
+> path (`mqttSetWriteChunkSize`) and the 2.12.4 initialisation backstop are the
+> open items: designed from five runs, not yet run themselves. The record is `docs/ENGINE-NOTES.md`.
 
 ## Table of Contents
 
@@ -316,12 +316,16 @@ Initialise the library's globals. Idempotent.
 mqttInitialize
 ```
 
-**When you must call it:** whenever the library is EMBEDDED in your own stack
+**When you should call it:** whenever the library is EMBEDDED in your own stack
 script rather than loaded with `start using`. The engine sends `libraryStack`
-only to a stack in `stacksInUse`, so an embedded copy never receives it and its
-globals stay empty; the first connection then runs against an uninitialised
-buffer limit and keep-alive threshold. `libraryStack` calls this itself, so the
-library-stack path needs nothing.
+only to a stack in `stacksInUse`, so an embedded copy never receives it.
+`libraryStack` calls this itself, so the library-stack path needs nothing.
+
+**Since 2.12.4 the library also calls it for you** from `mqttConnect` if it has
+not yet run, so a host that forgets cannot connect against empty globals. Call
+it anyway: the getters (`mqttGetKeepAliveThreshold`, `mqttGetWriteChunkSize`)
+report the raw state before any connect, and a self-check that reads them on a
+fresh engine will see empty values until something initialises the library.
 
 **Example:**
 ```OXT
@@ -837,7 +841,7 @@ function mqttTestLibrary()
 **Example:**
 ```OXT
 put mqttTestLibrary()
--- Returns: "MQTT Library v2.12.3 loaded successfully"
+-- Returns: "MQTT Library v2.12.4 loaded successfully"
 ```
 
 ---
