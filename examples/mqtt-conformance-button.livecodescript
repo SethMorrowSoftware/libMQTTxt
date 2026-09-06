@@ -40,26 +40,42 @@
 constant kCtHost2 = ""
 constant kCtPort2 = 1883
 
--- THE WRITE-PATH PROBE, and it is the first thing the run does.
+-- THE PACING LADDER, and it is the first thing the run does.
 --
--- The eighth engine run stalled a 1 MB publish against a local mosquitto with
--- nothing subscribed to the topic, so the stall is not the broker blocking on
--- an echo. What is left is the broker, the network path, or the engine's own
--- plaintext write path - and the same engine carried 1 MB to hivemq over TLS.
+-- The ninth run settled WHERE the large-write stall lives. The same megabyte,
+-- in the clear, stalled against a local mosquitto over a LAN (after 442368
+-- bytes) AND against broker.hivemq.com over the internet (after 65536). Two
+-- brokers, two paths, same failure - while the same engine carried a megabyte
+-- to that same broker over TLS without a pause. The broker is not the variable
+-- and the network is not the variable. Plaintext is.
 --
--- So: the same 1 MB, in the clear, to a DIFFERENT broker over a DIFFERENT
--- path, on its own connection, before anything else in the run.
---   it passes -> the engine writes a megabyte of plaintext fine, and the
---                stall belongs to the broker under test or the path to it
---   it fails  -> the engine's plaintext write path is the suspect; TLS is the
---                only shape that has ever carried this much
+-- WHAT THAT LEAVES, and it is the reading the numbers fit: the engine's
+-- plaintext write does one non-blocking send and does not retry a socket that
+-- is momentarily full. Chunking never addressed that, because chunks written
+-- back to back at a yield of ZERO cost no elapsed time - the kernel's send
+-- buffer is filled faster than the wire drains it, and the first chunk that
+-- meets a full buffer times out. The byte counts are simply how much fitted
+-- before that happened, which is why they move with the path (65536 over a
+-- slow internet link, 442368 on a LAN) and between runs.
 --
--- It runs FIRST because a stall later in the run resets the connection and
--- aborts everything after it - which is exactly when this answer is wanted.
--- Set kCtAltHost to empty to skip it.
+-- SO THE EXPERIMENT IS PACING, not size. The same megabyte, over and over, at
+-- an increasing pause between chunks, on its own connection to a second
+-- broker. The answer wanted is the smallest pause at which a megabyte gets
+-- through - and if one does, the run keeps that value for everything after it,
+-- so the ladder further down becomes a second test of the same fix.
+--
+-- It runs FIRST because a stall later resets the connection and aborts the
+-- rest, which is exactly when this answer is wanted. Set kCtAltHost to empty
+-- to skip it.
 constant kCtAltHost = "broker.hivemq.com"
 constant kCtAltPort = 1883
 constant kCtAltSize = 1048576
+
+-- Milliseconds of pause per 16 KB chunk to try, in order. 0 is the current
+-- default and the one that has failed on every plaintext path so far; 50 gives
+-- a megabyte 3.2 seconds of deliberate pacing, which is slow and would still be
+-- an answer.
+constant kCtYieldLadder = "0,5,20,50"
 
 -- How long the idle hold runs. It must exceed the ping threshold (keep-alive x
 -- mqttGetKeepAliveThreshold, so 45s at the dashboard's defaults) with room for
@@ -84,6 +100,7 @@ local sCtHoldEnd, sCtKey2
 local sCtPhase           -- sub-state within a multi-step stage
 local sCtBigStep, sCtBigOk   -- the large-payload ladder's position and high-water mark
 local sCtWriteMs             -- how long the current rung's write call took
+local sCtProbeStep           -- the pacing ladder's position in kCtYieldLadder
 
 on mouseUp
    if sCtRunning is "true" then
@@ -120,6 +137,7 @@ command ctBegin
    put 0 into sCtPhase
    put 1 into sCtBigStep
    put 0 into sCtBigOk
+   put 1 into sCtProbeStep
    put empty into sCtKey2
 
    -- Unique per run, so a retained message left by an earlier run cannot be
@@ -253,37 +271,57 @@ end ctTick
 
 -- ---- stages ---------------------------------------------------------------
 
--- THE WRITE-PATH PROBE. See kCtAltHost at the top for why this exists and what
--- each outcome means. It runs on its OWN connection to a second broker, so
--- nothing it does can disturb the run that follows, and it runs first so that a
--- stall later - which aborts everything after it - cannot cost us this answer.
+-- THE PACING LADDER. See kCtAltHost at the top for why this exists.
 --
--- A broker that cannot be reached is a SKIP, not a failure: no internet is not
--- a finding about this library. A broker that accepts the connection and then
--- stalls the write IS a finding.
+-- Each rung is a whole attempt on a FRESH connection to the second broker: set
+-- the pause, connect, publish a megabyte, wait for its PUBACK, disconnect. A
+-- rung that stalls moves to the next pause. A rung that succeeds ends the
+-- stage AND LEAVES THAT PAUSE SET, so everything after it in the run - the
+-- ladder included - runs with the pacing that worked. That makes the rest of
+-- the run a second, independent test of the same answer.
+--
+-- Fresh connection per rung on purpose: a stalled write leaves a stream the
+-- broker can no longer parse, so the library resets it. Retrying on the wreck
+-- would measure the wreck.
+--
+-- A broker that cannot be reached is a SKIP: no internet is not a finding about
+-- this library. A broker that accepts the connection and then stalls IS one.
 command ctStageAltWrite
-   local tRc, tInfo, tT0, tWriteMs
+   local tRc, tInfo, tT0, tWriteMs, tYield, tRungs
 
    if kCtAltHost is empty then
-      ctSkip "the write-path probe", "no kCtAltHost set at the top of this script"
+      ctSkip "the pacing ladder", "no kCtAltHost set at the top of this script"
       ctNext
       exit ctStageAltWrite
    end if
 
    if kCtAltHost is sCtHost and kCtAltPort is sCtPort then
-      ctSkip "the write-path probe", "kCtAltHost is the broker under test, so " \
-            & "it would prove nothing"
+      ctSkip "the pacing ladder", "kCtAltHost is the broker under test, so it " \
+            & "would prove nothing about the path"
       ctNext
       exit ctStageAltWrite
    end if
 
+   put the number of items of kCtYieldLadder into tRungs
+   if sCtProbeStep > tRungs then
+      ctFail "the pacing ladder", kCtAltSize & " bytes never went out at any " \
+            & "pause in " & kCtYieldLadder & "ms - pacing is not the answer, " \
+            & "or not the whole answer"
+      mqttSetWriteYieldMs 0
+      ctNext
+      exit ctStageAltWrite
+   end if
+   put item sCtProbeStep of kCtYieldLadder into tYield
+
    switch sCtPhase
       case 0
+         mqttSetWriteYieldMs tYield
          put mqttConnect(kCtAltHost, kCtAltPort, \
                "libmqttxt-ctprobe-" & the milliseconds, empty, empty, 60, \
                false, true, empty, empty, 0, false, true, false, empty) into tRc
          if tRc is not "OK" then
-            ctSkip "the write-path probe", tRc
+            ctSkip "the pacing ladder", tRc
+            mqttSetWriteYieldMs 0
             ctNext
             exit ctStageAltWrite
          end if
@@ -298,8 +336,9 @@ command ctStageAltWrite
             exit ctStageAltWrite
          end if
          if sCtTicks >= kCtDeadline then
-            ctSkip "the write-path probe", kCtAltHost & " never reached CONNACK"
+            ctSkip "the pacing ladder", kCtAltHost & " never reached CONNACK"
             mqttDisconnect kCtAltHost, kCtAltPort
+            mqttSetWriteYieldMs 0
             ctNext
          end if
          break
@@ -313,15 +352,12 @@ command ctStageAltWrite
          put tWriteMs into sCtWriteMs
 
          if tRc is not "OK" then
-            ctFail "the write-path probe: " & kCtAltSize & " bytes in the " \
-                  & "clear to " & kCtAltHost, tRc & " (the write call took " \
-                  & tWriteMs & "ms)"
-            ctSay "      NOTE: a large plaintext write stalls against a SECOND " \
-                  & "broker over a DIFFERENT path too. That points at the " \
-                  & "engine's plaintext write path, not at any one broker - " \
-                  & "and TLS is the only shape that has carried this size."
+            ctSay "      pause " & tYield & "ms per chunk: " & tRc \
+                  & " (after " & tWriteMs & "ms)"
             mqttDisconnect kCtAltHost, kCtAltPort
-            ctNext
+            add 1 to sCtProbeStep
+            put 0 into sCtPhase
+            put 0 into sCtTicks
             exit ctStageAltWrite
          end if
          put 3 into sCtPhase
@@ -331,21 +367,31 @@ command ctStageAltWrite
       case 3
          put mqttGetConnectionInfo(kCtAltHost, kCtAltPort) into tInfo
          if tInfo["pendingAcks"] is empty then
-            ctPass "the write-path probe: " & kCtAltSize & " bytes written in " \
-                  & "the clear to " & kCtAltHost & " and PUBACKed (write call " \
-                  & sCtWriteMs & "ms, " & ctRate(kCtAltSize, sCtWriteMs) & ")"
-            ctSay "      NOTE: the engine writes a megabyte of plaintext " \
-                  & "without stalling, so a stall below belongs to the broker " \
-                  & "under test or to the path to it."
+            ctPass kCtAltSize & " bytes in the clear to " & kCtAltHost \
+                  & " at a " & tYield & "ms pause per chunk, PUBACKed (write " \
+                  & "call " & sCtWriteMs & "ms, " \
+                  & ctRate(kCtAltSize, sCtWriteMs) & ")"
+            if tYield is 0 then
+               ctSay "      NOTE: no pacing needed on this path - the engine " \
+                     & "wrote a megabyte of plaintext straight through. A " \
+                     & "stall below belongs to the broker under test."
+            else
+               ctSay "      NOTE: a " & tYield & "ms pause per chunk is what " \
+                     & "made this go through, and it stays set for the rest " \
+                     & "of the run - so the ladder below now tests the same " \
+                     & "answer against the broker under test."
+            end if
             mqttDisconnect kCtAltHost, kCtAltPort
             ctNext
             exit ctStageAltWrite
          end if
          if sCtTicks >= kCtDeadlineBig then
-            ctFail "the write-path probe", "no PUBACK from " & kCtAltHost \
-                  & " for " & kCtAltSize & " bytes"
+            ctSay "      pause " & tYield & "ms per chunk: written, but no " \
+                  & "PUBACK within " & (kCtDeadlineBig * kCtTickMs) & "ms"
             mqttDisconnect kCtAltHost, kCtAltPort
-            ctNext
+            add 1 to sCtProbeStep
+            put 0 into sCtPhase
+            put 0 into sCtTicks
          end if
          break
    end switch

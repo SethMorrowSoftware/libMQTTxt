@@ -8,12 +8,14 @@ Version 2.12.7 - OXT MQTT 3.1.1 Implementation
 > auto-reconnect back-off are observed working, and payloads to 1 MB round-trip
 > over the internet path.
 >
-> **One open defect, cause not established:** on a low-latency plaintext path to
-> a local mosquitto, a publish of roughly 100 KB or more may stall and reset the
-> connection. Two explanations have been tested and refuted; 2.12.7 ships the
-> experiments for the rest. See `docs/ENGINE-NOTES.md` 1.1. Not yet observed
-> either: a reconnect that succeeds, two connections at once, the persistent
-> store, and certificate verification refusing a bad certificate.
+> **One open defect, cause now isolated:** a **plaintext** publish beyond roughly
+> 64 KB to 400 KB (the point moves with the network path) can stall and reset the
+> connection. Observed against two brokers on two networks in one run, while the
+> same engine carried the same megabyte to one of them over TLS. **TLS is
+> unaffected; use it, or keep plaintext publishes small.** The fix is not settled
+> yet — see `docs/ENGINE-NOTES.md` 1.1. Not yet observed either: a reconnect that
+> succeeds, two connections at once, the persistent store, and certificate
+> verification refusing a bad certificate.
 
 ## Table of Contents
 
@@ -318,12 +320,17 @@ mqttSetWriteYieldMs pMilliseconds
 **Zero is not "no pause".** It is a yield: one turn of the engine's event loop,
 costing pending messages their run and no elapsed time.
 
-**A non-zero value is a diagnostic, not a setting to leave on.** A large publish
-can still stall on a low-latency plaintext path with no inbound traffic to
-explain it (`docs/ENGINE-NOTES.md` 1.1). One reading still standing is that the
-engine needs real elapsed time, rather than merely a turn of the loop, to push
-what it has already accepted. This makes that testable. It costs the given delay
-per chunk, so a 1 MB payload at 16 KB chunks and 20 ms adds 1.3 seconds.
+**A non-zero value is the current workaround for the large plaintext write
+stall.** The engine's plaintext write hands the kernel one non-blocking send and
+does not retry a socket that is momentarily full, so writing chunks back to back
+at zero pause fills the send buffer faster than the wire drains it and the first
+chunk to meet a full buffer times out (`docs/ENGINE-NOTES.md` 1.1). A pause
+gives the buffer time to drain. It costs the given delay per chunk, so a 1 MB
+payload at 16 KB chunks and 20 ms adds 1.3 seconds.
+
+**How much you need depends on your uplink**, which is why there is no
+non-zero default yet. Raise it until your largest publish goes through. TLS
+connections do not need it at all.
 
 **Example:**
 ```OXT

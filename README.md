@@ -426,24 +426,30 @@ refused every attempt, and a manual disconnect stopped it cleanly. It also
 found the reconnect log line reporting a clamped attempt number, fixed in
 2.12.5.
 
-Runs seven and eight took that ladder back to the mosquitto LAN path in the
-clear and **refuted two diagnoses in a row.** Chunking worked as designed and
-the write stalled anyway; then the yield was added and a megabyte to a topic
-with *no subscriber* stalled after twenty of sixty-four chunks. So neither the
-send-buffer reading nor the echo reading survives. What survives is a stall in
-the write path itself, in this broker, or in the LAN path to it. Every failure
-has the same shape: a burst of chunks accepted instantly, then one chunk making
-zero progress for exactly the socket timeout.
+Runs seven and eight refuted two diagnoses in a row, and **the ninth found the
+cause by controlled comparison.** In one run, the same 1 MB publish in the clear
+stalled against a local mosquitto over a LAN *and* against `broker.hivemq.com`
+over the internet — while the same engine had carried that same megabyte to that
+same broker over TLS without a pause. Two brokers, two networks, one variable:
+plaintext.
 
-**The known limitation, stated plainly:** on a low-latency plaintext path to a
-local mosquitto, a publish of roughly 100 KB or more may stall and reset the
-connection. The library detects it, reports how many bytes went out, and tears
-the connection down rather than leaving a corrupt stream — but the publish does
-not go through. The same engine carries 1 MB over TLS to a remote broker without
-trouble. 2.12.7 ships the two experiments that separate the remaining causes,
-and the conformance button runs the first of them before anything else.
+**The known limitation, stated plainly.** A plaintext publish beyond roughly
+64 KB to 400 KB — the exact point moves with the network path — can stall and
+reset the connection. The library detects it, reports how many bytes went out,
+and tears the connection down rather than leaving a corrupt stream, but the
+publish does not go through. **TLS is unaffected.** If you need large payloads
+today, use TLS, or keep publishes small.
 
-**Still unproven:** the cause of that stall; a reconnect that *succeeds* and
+The reading that fits every measurement: the engine's plaintext write hands the
+kernel one non-blocking send and does not retry a socket that is momentarily
+full. Chunking never addressed that, because chunks written back to back cost no
+elapsed time — the send buffer fills faster than the wire drains it. The stall
+points are simply how much fitted first, which is why they track the network
+path rather than the payload size.
+
+**Still unproven:** the fix. The conformance button now measures the smallest
+per-chunk pause at which a megabyte gets through, which decides between a paced
+default and asynchronous writes. Also unproven: a reconnect that *succeeds* and
 resubscribes; multi-connection; the persistent store; and certificate
 verification rejecting a bad certificate. The performance figures below are from
 2.11.x and have not been re-measured.
@@ -519,26 +525,28 @@ MQTT 3.1.1 Specification Implementation:
 
 ### 2.12.7 (Current)
 
-From the eighth engine run, which **refuted the 2.12.6 diagnosis too**. This
-release is instrumentation, not a fix: two hypotheses are now dead and three
-stand, and guessing a third time is not the way to settle it.
+From the eighth and ninth engine runs. The eighth refuted the 2.12.6 diagnosis;
+**the ninth found the cause by controlled comparison.**
 
-- **The echo is not the cause.** A 1 MB publish to a topic with *no subscriber*
-  stalled after twenty of sixty-four chunks, with the yield in place. There was
-  nothing to echo and nothing backing up inbound.
-- **A write-path probe now runs first in the conformance button.** It publishes
-  the same megabyte in the clear to a second broker over a different network
-  path, on its own connection, before anything else — because a stall later in
-  the run aborts everything after it. If that passes, the engine writes large
-  plaintext fine and the local broker or LAN path owns the stall. If it fails,
-  the engine's plaintext write path is the suspect, since TLS is the only shape
-  that has carried this size.
-- **`mqttSetWriteYieldMs`** makes the inter-chunk yield a settable pause. Zero,
-  the default, is a yield costing no elapsed time. A non-zero value tests
-  whether the engine needs real time rather than a turn of the loop to drain
-  what it has accepted.
-- The yield and its re-entrancy lock from 2.12.6 cost nothing observable: every
-  stage before the large payloads passed unchanged.
+- **The stall is in plaintext writing, not in any broker.** In one run the same
+  1 MB publish stalled against a local mosquitto over a LAN (after 442368 bytes)
+  and against `broker.hivemq.com` over the internet (after 65536) — while the
+  same engine had carried that megabyte to that same broker over TLS in 117 ms.
+  Two brokers, two networks, one variable. Every broker-side explanation is dead.
+- **The echo is not the cause either** (the eighth run): a megabyte to a topic
+  with no subscriber stalled the same way.
+- **The reading that fits everything:** the engine's plaintext write does one
+  non-blocking send and does not retry a momentarily full socket. Chunking never
+  addressed that, because chunks written back to back cost no elapsed time. The
+  stall points are just how much fitted before the send buffer filled, which is
+  why they track the network path and not the payload size.
+- **`mqttSetWriteYieldMs`** turns the inter-chunk yield into a settable pause —
+  the workaround, and the instrument. The conformance button's first stage is
+  now a pacing ladder that republishes a megabyte at 0, 5, 20 and 50 ms per
+  chunk on fresh connections and reports the smallest pause that works, keeping
+  a working value set so the rest of the run retests it.
+- The yield and re-entrancy lock from 2.12.6 cost nothing observable: every
+  stage before the large payloads passed unchanged, twice.
 
 ### 2.12.6
 
