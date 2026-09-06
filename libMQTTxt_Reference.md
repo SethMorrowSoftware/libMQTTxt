@@ -1,15 +1,18 @@
 # MQTT Client Library Reference
 
-Version 2.12.0 - OXT MQTT 3.1.1 Implementation
+Version 2.12.3 - OXT MQTT 3.1.1 Implementation
 
-> **Status: verified statically; needs an OXT pass.** The static gates under
-> `tools/` and the MQTT 3.1.1 protocol vectors are green, but no line of 2.12.0
-> has been observed on a running engine against a live broker.
+> **Status: first engine passes recorded 2026-09-05/06.** Compiles and loads on
+> OXT; connects to mosquitto and hivemq; QoS 0/1/2, UTF-8 and binary payloads,
+> retained, unsubscribe and keep-alive are observed working. The chunked write
+> path in 2.12.3 (`mqttSetWriteChunkSize`) is the current open item: designed
+> from four runs, not yet run itself. The record is `docs/ENGINE-NOTES.md`.
 
 ## Table of Contents
 
 - [Installation](#installation)
 - [Configuration Functions](#configuration-functions)
+- [Lifecycle and Engine Messages](#lifecycle-and-engine-messages)
 - [Connection Management](#connection-management)
 - [Publishing](#publishing)
 - [Subscribing](#subscribing)
@@ -236,6 +239,51 @@ mqttSetMaxBufferSize 5242880  -- 5MB
 
 ---
 
+### mqttSetWriteChunkSize
+
+Set the largest single write handed to the kernel, in bytes.
+
+```OXT
+mqttSetWriteChunkSize pBytes
+```
+
+**Parameters:**
+- `pBytes` - Integer (minimum 512; default 16384)
+
+**Why it exists:** the engine's synchronous socket write makes one `send()`.
+What fits in the kernel's TCP send buffer is accepted immediately; what does
+not fit is silently dropped when the write times out, leaving the broker holding
+a partial packet. That buffer is autotuned, so no single write size is safe on
+a cold connection. Every packet is written in chunks of at most this size, and
+a failed write reports how far it got (`timeout after 131072 of 204800 bytes`).
+See `docs/ENGINE-NOTES.md` 1.1. Lower it if large publishes time out; raising
+it towards the packet size reproduces the single-write behaviour it replaced.
+
+**Example:**
+```OXT
+mqttSetWriteChunkSize 8192  -- for a constrained or high-latency path
+```
+
+---
+
+### mqttGetWriteChunkSize
+
+Get the current write chunk size.
+
+```OXT
+mqttGetWriteChunkSize()
+```
+
+**Returns:** Integer, bytes
+
+**Example:**
+```OXT
+put mqttGetWriteChunkSize() into tChunk
+-- Returns: 16384
+```
+
+---
+
 ### mqttSetPersistentStore
 
 Enable persistent storage for QoS 1/2 messages.
@@ -252,6 +300,94 @@ mqttSetPersistentStore pEnabled, pStorePath
 ```OXT
 mqttSetPersistentStore true, specialFolderPath("documents") & "/mqtt"
 ```
+
+---
+
+## Lifecycle and Engine Messages
+
+These are public because the engine, or an embedding stack, has to be able to
+reach them. None is part of the everyday API.
+
+### mqttInitialize
+
+Initialise the library's globals. Idempotent.
+
+```OXT
+mqttInitialize
+```
+
+**When you must call it:** whenever the library is EMBEDDED in your own stack
+script rather than loaded with `start using`. The engine sends `libraryStack`
+only to a stack in `stacksInUse`, so an embedded copy never receives it and its
+globals stay empty; the first connection then runs against an uninitialised
+buffer limit and keep-alive threshold. `libraryStack` calls this itself, so the
+library-stack path needs nothing.
+
+**Example:**
+```OXT
+on preOpenStack
+   mqttInitialize
+end preOpenStack
+```
+
+---
+
+### mqttSocketConnected, mqttSocketDataAvailable
+
+The two callbacks the library names in `open socket ... with message` and
+`read from socket ... with message`. The engine calls them; you never do.
+
+```OXT
+on mqttSocketConnected pSocketID
+on mqttSocketDataAvailable pSocketID, pData
+```
+
+---
+
+### mqttSocketClosed, mqttSocketError, mqttSocketTimeout
+
+The logic behind the engine's three socket messages, as functions that answer
+one question: *was that socket mine, and did I handle it?*
+
+```OXT
+mqttSocketClosed(pSocketID)          -- returns true if consumed
+mqttSocketError(pSocketID, pError)   -- returns true if consumed
+mqttSocketTimeout(pSocketID)         -- returns true if consumed
+```
+
+**Why they are public:** `socketClosed`, `socketError` and `socketTimeout` are
+the ENGINE's names, so every socket library declares them and no script may
+define one twice. The library's own `on socketClosed` (and the other two) are
+thin wrappers that call these and `pass` anything that is not ours. A stack that
+runs its own sockets and must define the three engine handlers itself drops the
+library's wrappers and calls these functions from its own:
+
+```OXT
+on socketClosed pSocketID
+   if mqttSocketClosed(pSocketID) then
+      exit socketClosed
+   end if
+   -- your own socket handling
+end socketClosed
+```
+
+`mqttSocketTimeout` ignores a timeout on a CONNECTED socket: `socketTimeout`
+repeats while a read is pending, and the library always has one pending, so on a
+live connection it means "idle" and nothing more. It is fatal only before
+CONNACK.
+
+---
+
+### mqttTestCallbackFromLibrary
+
+A debugging aid: sends `testLibraryToCard` to the object you name and reports
+whether the send succeeded.
+
+```OXT
+mqttTestCallbackFromLibrary pTargetCard
+```
+
+**Returns:** `"OK - send succeeded"` or `"ERROR: <reason>"`
 
 ---
 
@@ -701,7 +837,7 @@ function mqttTestLibrary()
 **Example:**
 ```OXT
 put mqttTestLibrary()
--- Returns: "MQTT Library v2.12.0 loaded successfully"
+-- Returns: "MQTT Library v2.12.3 loaded successfully"
 ```
 
 ---

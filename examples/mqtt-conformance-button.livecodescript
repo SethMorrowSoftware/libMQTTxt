@@ -134,6 +134,7 @@ command ctBegin
    -- PUBLISH that exceeds it fails with "timeout" (engine notes 1.1), so the
    -- value belongs in the record beside any size that fails.
    ctSay "   socketTimeoutInterval " & the socketTimeoutInterval & "ms"
+   ctSay "   write chunk size " & mqttGetWriteChunkSize() & " bytes"
 
    send "ctTick" to me in kCtTickMs milliseconds
 end ctBegin
@@ -405,7 +406,12 @@ command ctStageBig
 
    put ctBigSize(sCtBigStep) into tSize
    if tSize is 0 then
-      ctPass "large payloads round-trip up to " & sCtBigOk & " bytes"
+      if sCtBigOk >= 1048576 then
+         ctPass "large payloads round-trip up to " & sCtBigOk & " bytes - past " \
+               & "any kernel send buffer, so the chunked write is doing its job"
+      else
+         ctPass "large payloads round-trip up to " & sCtBigOk & " bytes"
+      end if
       ctNext
       exit ctStageBig
    end if
@@ -466,7 +472,9 @@ command ctStageBig
       exit ctStageBig
    end if
 
-   if sCtTicks >= kCtDeadlineBig then
+   -- The deadline scales with the rung: 20s is generous for 200 KB and thin
+   -- for 1 MB over an internet path.
+   if sCtTicks >= (kCtDeadlineBig * max(1, tSize div 204800)) then
       if sCtBigOk > 0 then
          ctFail "large payload", tSize & " bytes never came back, though " \
                & sCtBigOk & " bytes did - the ceiling is between them"
@@ -490,6 +498,12 @@ end ctRate
 -- socket buffer, and 128 KB is the first whose Remaining Length needs three
 -- varint bytes.
 function ctBigSize pStep
+   -- Doubling from 4 KB. 64 KB is the first size past a typical socket
+   -- buffer; 128 KB is the first whose Remaining Length needs three varint
+   -- bytes; 204800 is where run 4 failed with a single write. The last two
+   -- rungs are the point of the chunked write: 512 KB and 1 MB are well past
+   -- any kernel send buffer, so they round-trip ONLY if the library never
+   -- hands the kernel more than it can take in one send().
    switch pStep
       case 1
          return 4096
@@ -501,6 +515,10 @@ function ctBigSize pStep
          return 131072
       case 5
          return 204800
+      case 6
+         return 524288
+      case 7
+         return 1048576
    end switch
    return 0
 end ctBigSize
