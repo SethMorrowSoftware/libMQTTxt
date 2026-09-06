@@ -102,6 +102,7 @@ local sCtPass, sCtFail, sCtSkip
 local sCtLog
 local sCtBase, sCtQuiet, sCtHost, sCtPort
 local sCtSeen            -- topic -> payload, filled by ctOnMessage
+local sCtSeenAt          -- topic -> the milliseconds it ARRIVED, for real timings
 local sCtCount           -- topic -> how many times it arrived (QoS 2 dedup)
 local sCtUtf8, sCtBin, sCtBig
 local sCtHoldEnd, sCtKey2
@@ -141,6 +142,7 @@ command ctBegin
    put 0 into sCtSkip
    put empty into sCtLog
    put empty into sCtSeen
+   put empty into sCtSeenAt
    put empty into sCtCount
    put 1 into sCtStage
    put 0 into sCtTicks
@@ -212,7 +214,14 @@ end ctBegin
 -- Every message that arrives during the run lands here. Recorded by topic, with
 -- a COUNT, because "exactly once" is a claim about the count and not only about
 -- the payload.
+-- THE ARRIVAL TIME IS STAMPED HERE, not where the stage notices it. A stage
+-- polls every kCtTickMs, so "elapsed" measured at the poll is the true time
+-- rounded UP to the next tick: the twelfth run reported a 4 KB round trip as
+-- 262ms and 15 KB/s, when every one of its timings was within 15ms of a whole
+-- number of 250ms ticks. Those were readings of the instrument, not of the
+-- library. This callback runs the moment the message lands.
 on ctOnMessage pTopic, pMessage
+   put the milliseconds into sCtSeenAt[pTopic]
    put pMessage into sCtSeen[pTopic]
    add 1 to sCtCount[pTopic]
 end ctOnMessage
@@ -398,10 +407,10 @@ command ctStageAltWrite
          put mqttGetConnectionInfo(kCtAltHost, kCtAltPort) into tInfo
          if tInfo["pendingAcks"] is empty then
             ctPass kCtAltSize & " bytes in the clear to " & kCtAltHost \
-                  & " at a " & tYield & "ms pause per chunk, PUBACKed in " \
-                  & (the milliseconds - sCtT0) & "ms (" \
-                  & ctRate(kCtAltSize, the milliseconds - sCtT0) \
-                  & "; the write call itself took " & sCtWriteMs & "ms)"
+                  & " at a " & tYield & "ms pause per chunk, PUBACKed within " \
+                  & (the milliseconds - sCtT0) & "ms (polled every " \
+                  & kCtTickMs & "ms, so an upper bound; the write call itself " \
+                  & "took " & sCtWriteMs & "ms)"
             if tYield is 0 then
                ctSay "      NOTE: no pacing needed on this path - the engine " \
                      & "wrote a megabyte of plaintext straight through. A " \
@@ -659,9 +668,15 @@ command ctStageNoEcho
 
    put mqttGetConnectionInfo(sCtHost, sCtPort) into tInfo
    if tInfo["pendingAcks"] is empty then
-      ctPass tLabel & " was PUBACKed in " & (the milliseconds - sCtT0) & "ms (" \
-            & ctRate(tSize, the milliseconds - sCtT0) \
-            & "; write call " & sCtWriteMs & "ms)"
+      -- NO RATE HERE, and the reason is worth stating. Nothing calls back when
+      -- a PUBACK lands, so this stage can only notice it at the next poll:
+      -- the figure is the true time rounded up to kCtTickMs, and dividing a
+      -- payload by it would report the poll interval dressed up as throughput.
+      -- The echo-based ladder below has a real arrival stamp; this one says
+      -- what it actually knows.
+      ctPass tLabel & " was PUBACKed within " & (the milliseconds - sCtT0) \
+            & "ms (polled every " & kCtTickMs & "ms, so an upper bound; the " \
+            & "write call itself took " & sCtWriteMs & "ms)"
       ctNext
       exit ctStageNoEcho
    end if
@@ -753,12 +768,15 @@ command ctStageBig
          put 0 into sCtTicks
          put false into sCtEntered
          -- THE ROUND TRIP is the number that means the same thing on both
-         -- write paths: published, carried by the broker, and back. The write
-         -- call is printed beside it because under asynchronous writes it is
-         -- an enqueue and the gap between the two is the point.
-         ctSay "      " & tSize & " bytes round-tripped intact in " \
-               & (the milliseconds - sCtT0) & "ms (" \
-               & ctRate(tSize, the milliseconds - sCtT0) \
+         -- write paths: published, carried by the broker, and back. Taken from
+         -- the arrival stamp, not from this poll, so it is a millisecond
+         -- measurement rather than a multiple of kCtTickMs. The write call is
+         -- printed beside it because under asynchronous writes it is an
+         -- enqueue, and the gap between the two is the point.
+         local tRtt
+         put sCtSeenAt[tTopic] - sCtT0 into tRtt
+         ctSay "      " & tSize & " bytes round-tripped intact in " & tRtt \
+               & "ms (" & ctRate(tSize, tRtt) \
                & "; write call " & sCtWriteMs & "ms)"
       else
          ctFail "large payload at " & tSize & " bytes", "got back " \
@@ -783,6 +801,11 @@ end ctStageBig
 
 -- KB/s for the record, with a floor of 1ms so an instant write does not divide
 -- by zero and read as infinite.
+--
+-- ONLY CALL THIS ON A TIME THAT WAS ACTUALLY MEASURED. A duration taken at a
+-- poll is quantised to kCtTickMs, and a rate computed from one says more about
+-- the poll interval than about the link - which is exactly what the twelfth
+-- run's "15 KB/s" for a 4 KB payload was.
 function ctRate pBytes, pMs
    if pMs < 1 then
       put 1 into pMs
