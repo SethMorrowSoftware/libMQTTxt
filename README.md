@@ -397,7 +397,10 @@ That same run found two things the gates could not:
   Fixed in 2.12.1; a gate now refuses a bare `write ... to socket`.
 - **`secure socket ... with verification` reported success on a plaintext
   port.** Treat TLS status as unverified regardless of what the log says, and
-  confirm a TLS connection reached CONNACK before trusting it. Not yet closed.
+  confirm a TLS connection reached CONNACK before trusting it. Not yet closed:
+  the sixth run showed TLS working end to end against a valid certificate on
+  port 8883, which proves the channel and still says nothing about what
+  "verified" would do with a bad one.
 
 A second run the same day, against `broker.hivemq.com` with the write check
 in place, added **keep-alive end to end** (100s idle, PINGRESP received and
@@ -408,12 +411,27 @@ the library was right.
 
 Runs three and four, back on the mosquitto that first failed, confirmed the
 diagnosis and located the cause: a synchronous write that exceeds the kernel's
-send buffer silently drops its tail. 2.12.3 chunks every write; the 1 MB rung of
-the conformance ladder is the test of that fix and has not yet run.
+send buffer silently drops its tail. 2.12.3 chunks every write.
 
-**Still unproven:** the chunked write itself (the 1 MB rung), auto-reconnect
-after a broker restart, multi-connection, persistent store, and TLS. The
-performance figures below are from 2.11.x and have not been re-measured.
+The fifth run, on a fresh engine, found the embedded library uninitialised (the
+earlier runs had inherited populated globals from a standalone-library session)
+and 2.12.4 made the library initialise itself before it touches the network.
+
+The sixth run, 2026-09-06, was the first over **TLS** (verified, against
+`broker.hivemq.com:8883`) and the first with **auto-reconnect** ticked. The
+conformance run was green at every stage, 14 passed and 0 failed, and the
+ladder round-tripped **1 MB** intact. Auto-reconnect's back-off was observed
+(1, 2, 4, 8, 16 s, then 30 s with jitter, unbounded) against a port that
+refused every attempt, and a manual disconnect stopped it cleanly. It also
+found the reconnect log line reporting a clamped attempt number, fixed in
+2.12.5.
+
+**Still unproven:** the 1 MB rung on the mosquitto LAN path in the clear, which
+is the run that would confirm the send-buffer mechanism (the hivemq path had
+carried 200 KB before chunking existed); a reconnect that *succeeds* and
+resubscribes; multi-connection; the persistent store; and certificate
+verification rejecting a bad certificate. The performance figures below are
+from 2.11.x and have not been re-measured.
 
 ## Performance
 
@@ -484,7 +502,34 @@ MQTT 3.1.1 Specification Implementation:
 
 ## Version History
 
-### 2.12.4 (Current)
+### 2.12.5 (Current)
+
+From the sixth engine run: the first over TLS, the first with auto-reconnect
+ticked, and the first green conformance run at every rung of the ladder.
+
+- **The reconnect log reports the real attempt number.** The back-off clamps the
+  exponent at 16 so `2 ^ n` cannot overflow across a long outage; the log line
+  reused the clamped variable and read `attempt 17` for forty attempts running.
+  The count and the exponent are now separate, and the callback, which always
+  read the counter directly, is unchanged.
+- **Self-initialisation is logged.** When `mqttConnect` finds the library
+  uninitialised it now says so (`Library initialised on first use ...`), so an
+  embedder whose `preOpenStack` did not take effect sees it in the log instead
+  of deducing it from a missing line. The sixth run could only infer that this
+  path had carried its connection; the next one can observe it.
+- The conformance ladder's 1 MB PASS line states what it saw and no longer
+  claims why; the first 1 MB pass came over TLS to a broker that had carried
+  200 KB before chunking existed, which proves the size and not the mechanism.
+  The run's cleanup also no longer unsubscribes a filter it has already dropped.
+- The demo header tells the truth about six engine runs, and says REOPEN: applying
+  a script to an open stack sends neither `preOpenStack` nor `openStack`, which
+  the sixth run demonstrated by getting no boot block at all.
+- `docs/ENGINE-NOTES.md`: 1.1 (1 MB observed, mechanism still inferred), 1.2
+  (TLS end to end observed; "verified" still unproven), new 1.5 (auto-reconnect
+  observed, unbounded by design), 2.1 (the backstop inferred to have carried
+  the connection), and the sixth run record.
+
+### 2.12.4
 
 From the fifth engine run, the first on a fresh engine session, and the first
 time the boot self-check failed for a real reason.

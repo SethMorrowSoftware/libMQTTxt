@@ -23,19 +23,31 @@ script "MqttDashboard"
 --   1. Paste THIS file into a stack script and reopen the stack - opening the
 --      file itself builds no window (OXT-ENGINE-NOTES 5.5). libMQTTxt is
 --      embedded already, so there is nothing else to load.
+--      REOPEN, not just Apply: applying a script to a stack that is already
+--      open sends neither preOpenStack nor openStack, so nothing rebuilds and
+--      the boot self-check below does not run (the sixth engine run applied a
+--      new version this way and got no boot block at all - correct, and easy
+--      to mistake for a check that passed silently).
 --   2. The form is pre-filled for a public test broker. Press Connect, then
 --      Subscribe, then Publish to the topic you subscribed to and watch it
 --      come back.
 --
 -- TLS: tick TLS for port 8883. "Verify cert" is ON by default and should stay
 -- that way; an unverified TLS socket is encrypted against a passive listener
--- and worthless against an active one.
+-- and worthless against an active one. Port 8883 WITHOUT TLS is the most
+-- common mistake and looks like a broker that drops you right after CONNECT;
+-- the log says so when you try it.
 --
--- HONESTY (the suite convention): this stack has NOT run on an OXT engine
--- against a live broker. libMQTTxt 2.12.0 is verified statically - its gates
--- and MQTT 3.1.1 protocol vectors are green offline - and this demo is the
--- surface that pass would be run through. Verified statically; needs an OXT
--- pass.
+-- HONESTY (the suite convention): this stack HAS run on an OXT engine, six
+-- times on 2026-09-05/06, against a local mosquitto and broker.hivemq.com, in
+-- the clear and over verified TLS. The full record is docs/ENGINE-NOTES.md
+-- (section 3 lists what each run established). Observed: the window builds,
+-- the embedded library connects, QoS 0/1/2, UTF-8 and binary payloads,
+-- retained, unsubscribe, keep-alive, auto-reconnect back-off, and payloads to
+-- 1 MB. Not yet observed: a successful reconnect (every attempt so far was to
+-- a port that refused it), two connections at once, the persistent store, and
+-- this boot check on a fresh engine since its 2.12.4 split. Each of those is
+-- still "verified statically; needs an OXT pass".
 --
 -- THE LOOK is the suite UI kit, carried verbatim between the marker lines
 -- (master: tools/ui-kit.livecodescript, vendored from xtalk-suite - see
@@ -913,7 +925,7 @@ command mqttCleanupAll
 end mqttCleanupAll
 
 function mqttTestLibrary
-   return "MQTT Library v2.12.4 loaded successfully"
+   return "MQTT Library v2.12.5 loaded successfully"
 end mqttTestLibrary
 
 function mqttSelfTest
@@ -1046,7 +1058,7 @@ function mqttSelfTest
    -- Summary
    put "MQTT Library Self-Test" & return into tResults
    put "=====================" & return after tResults
-   put "Version: 2.12.4" & return after tResults
+   put "Version: 2.12.5" & return after tResults
    put "Passed:" && tPassed & return after tResults
    put "Failed:" && tFailed & return after tResults
 
@@ -1721,6 +1733,12 @@ end __captureCallbackTarget
 -- host calling one line in one specific handler; this is the backstop.
 private command __ensureInit
    if gMQTTInitialized is not true then
+      -- Say so. The sixth engine run (docs/ENGINE-NOTES.md 2.1) could only
+      -- INFER that this path had saved the connection, because nothing logged
+      -- it; an embedder whose preOpenStack did not take effect should be told
+      -- in the log rather than left to deduce it from a missing first line.
+      __mqttLog "Library initialised on first use - mqttInitialize had not" && \
+            "run (an embedding stack should call it from preOpenStack)"
       mqttInitialize
    end if
 end __ensureInit
@@ -1812,23 +1830,27 @@ private command __handleReconnect pConnID
       exit __handleReconnect
    end if
 
-   local tHost, tPort, tAttempts, tDelay
+   local tHost, tPort, tAttempts, tExponent, tDelay
    put gMQTTConnections[pConnID]["host"] into tHost
    put gMQTTConnections[pConnID]["port"] into tPort
    put gMQTTConnections[pConnID]["reconnectAttempts"] into tAttempts
 
-   -- Calculate delay with exponential backoff (capped at 30 seconds). tAttempts
-   -- is clamped before the exponent: it grows without bound across a long
-   -- outage, and 2 ^ a few thousand is an overflow, not a big number.
    if tAttempts is not a number or tAttempts < 0 then
       put 0 into tAttempts
    end if
 
-   if tAttempts > 16 then
-      put 16 into tAttempts
+   -- Calculate delay with exponential backoff (capped at 30 seconds). The
+   -- EXPONENT is clamped, not the count: the count grows without bound across
+   -- a long outage, and 2 ^ a few thousand is an overflow, not a big number.
+   -- They were one variable until the sixth engine run (docs/ENGINE-NOTES.md
+   -- 1.5) logged "attempt 17" forty times in a row while the real count kept
+   -- climbing - the clamp had been applied to the number being reported.
+   put tAttempts into tExponent
+   if tExponent > 16 then
+      put 16 into tExponent
    end if
 
-   put min(2 ^ tAttempts, 30) into tDelay
+   put min(2 ^ tExponent, 30) into tDelay
 
    -- Add random jitter to prevent thundering herd
    local tJitter

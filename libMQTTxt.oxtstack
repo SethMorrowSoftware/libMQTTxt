@@ -858,7 +858,7 @@ command mqttCleanupAll
 end mqttCleanupAll
 
 function mqttTestLibrary
-   return "MQTT Library v2.12.4 loaded successfully"
+   return "MQTT Library v2.12.5 loaded successfully"
 end mqttTestLibrary
 
 function mqttSelfTest
@@ -991,7 +991,7 @@ function mqttSelfTest
    -- Summary
    put "MQTT Library Self-Test" & return into tResults
    put "=====================" & return after tResults
-   put "Version: 2.12.4" & return after tResults
+   put "Version: 2.12.5" & return after tResults
    put "Passed:" && tPassed & return after tResults
    put "Failed:" && tFailed & return after tResults
 
@@ -1666,6 +1666,12 @@ end __captureCallbackTarget
 -- host calling one line in one specific handler; this is the backstop.
 private command __ensureInit
    if gMQTTInitialized is not true then
+      -- Say so. The sixth engine run (docs/ENGINE-NOTES.md 2.1) could only
+      -- INFER that this path had saved the connection, because nothing logged
+      -- it; an embedder whose preOpenStack did not take effect should be told
+      -- in the log rather than left to deduce it from a missing first line.
+      __mqttLog "Library initialised on first use - mqttInitialize had not" && \
+            "run (an embedding stack should call it from preOpenStack)"
       mqttInitialize
    end if
 end __ensureInit
@@ -1757,23 +1763,27 @@ private command __handleReconnect pConnID
       exit __handleReconnect
    end if
 
-   local tHost, tPort, tAttempts, tDelay
+   local tHost, tPort, tAttempts, tExponent, tDelay
    put gMQTTConnections[pConnID]["host"] into tHost
    put gMQTTConnections[pConnID]["port"] into tPort
    put gMQTTConnections[pConnID]["reconnectAttempts"] into tAttempts
 
-   -- Calculate delay with exponential backoff (capped at 30 seconds). tAttempts
-   -- is clamped before the exponent: it grows without bound across a long
-   -- outage, and 2 ^ a few thousand is an overflow, not a big number.
    if tAttempts is not a number or tAttempts < 0 then
       put 0 into tAttempts
    end if
 
-   if tAttempts > 16 then
-      put 16 into tAttempts
+   -- Calculate delay with exponential backoff (capped at 30 seconds). The
+   -- EXPONENT is clamped, not the count: the count grows without bound across
+   -- a long outage, and 2 ^ a few thousand is an overflow, not a big number.
+   -- They were one variable until the sixth engine run (docs/ENGINE-NOTES.md
+   -- 1.5) logged "attempt 17" forty times in a row while the real count kept
+   -- climbing - the clamp had been applied to the number being reported.
+   put tAttempts into tExponent
+   if tExponent > 16 then
+      put 16 into tExponent
    end if
 
-   put min(2 ^ tAttempts, 30) into tDelay
+   put min(2 ^ tExponent, 30) into tDelay
 
    -- Add random jitter to prevent thundering herd
    local tJitter

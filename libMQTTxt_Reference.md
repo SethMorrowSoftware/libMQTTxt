@@ -1,12 +1,14 @@
 # MQTT Client Library Reference
 
-Version 2.12.4 - OXT MQTT 3.1.1 Implementation
+Version 2.12.5 - OXT MQTT 3.1.1 Implementation
 
-> **Status: first engine passes recorded 2026-09-05/06.** Compiles and loads on
-> OXT; connects to mosquitto and hivemq; QoS 0/1/2, UTF-8 and binary payloads,
-> retained, unsubscribe and keep-alive are observed working. The chunked write
-> path (`mqttSetWriteChunkSize`) and the 2.12.4 initialisation backstop are the
-> open items: designed from five runs, not yet run themselves. The record is `docs/ENGINE-NOTES.md`.
+> **Status: six engine runs recorded 2026-09-05/06.** Compiles and loads on OXT;
+> connects to mosquitto and hivemq, in the clear and over verified TLS; QoS
+> 0/1/2, UTF-8 and binary payloads, retained, unsubscribe, keep-alive, payloads
+> to 1 MB and the auto-reconnect back-off are observed working. Not yet observed:
+> a reconnect that succeeds, two connections at once, the persistent store, and
+> certificate verification refusing a bad certificate. The record is
+> `docs/ENGINE-NOTES.md`.
 
 ## Table of Contents
 
@@ -147,6 +149,25 @@ end onReconnect
 ```
 
 **Events:** `attempting`, `success`, `failed`
+
+**Schedule, and there is no limit.** Attempts are spaced 1, 2, 4, 8, 16 s and
+then 30 s apart, each with up to 0.25 s of jitter, for as long as the
+connection stays down (observed on an engine, `docs/ENGINE-NOTES.md` 1.5). The
+library does not give up on its own except for a CONNACK refusal it cannot
+retry (codes 1, 4, 5; see `mqttConnect`). A broker that accepts the TCP
+connection and closes it after every CONNECT - the wrong port, typically - is
+retried every 30 s indefinitely. If your application wants a ceiling, this
+callback is where to put it: `pAttempts` is the count, and `mqttDisconnect`
+stops the chain.
+
+```OXT
+on onReconnect pEvent, pHost, pPort, pAttempts
+   if pEvent is "attempting" and pAttempts > 20 then
+      mqttDisconnect pHost, pPort
+      put "Gave up reconnecting to" && pHost & ":" & pPort
+   end if
+end onReconnect
+```
 
 ---
 
@@ -326,6 +347,9 @@ not yet run, so a host that forgets cannot connect against empty globals. Call
 it anyway: the getters (`mqttGetKeepAliveThreshold`, `mqttGetWriteChunkSize`)
 report the raw state before any connect, and a self-check that reads them on a
 fresh engine will see empty values until something initialises the library.
+Since 2.12.5 that fallback announces itself in the log (`Library initialised on
+first use - mqttInitialize had not run ...`); if you see that line, your
+`preOpenStack` did not take effect and it is worth finding out why.
 
 **Example:**
 ```OXT
@@ -841,7 +865,7 @@ function mqttTestLibrary()
 **Example:**
 ```OXT
 put mqttTestLibrary()
--- Returns: "MQTT Library v2.12.4 loaded successfully"
+-- Returns: "MQTT Library v2.12.5 loaded successfully"
 ```
 
 ---
@@ -978,9 +1002,14 @@ on handlerName pEvent, pHost, pPort, pAttempts
    -- pEvent: attempting, success, failed
    -- pHost: Broker hostname
    -- pPort: Broker port
-   -- pAttempts: Reconnection attempt number
+   -- pAttempts: Reconnection attempt number (unclamped; it keeps counting
+   --            for as long as the connection stays down)
 end handlerName
 ```
+
+Attempts continue indefinitely with a 30 s ceiling on the back-off; see
+`mqttSetReconnectCallback` for the schedule and for stopping the chain from
+this handler.
 
 **Example:**
 ```OXT

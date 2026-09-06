@@ -406,12 +406,14 @@ command ctStageBig
 
    put ctBigSize(sCtBigStep) into tSize
    if tSize is 0 then
-      if sCtBigOk >= 1048576 then
-         ctPass "large payloads round-trip up to " & sCtBigOk & " bytes - past " \
-               & "any kernel send buffer, so the chunked write is doing its job"
-      else
-         ctPass "large payloads round-trip up to " & sCtBigOk & " bytes"
-      end if
+      -- The PASS states what was seen and nothing about why. An earlier version
+      -- added "so the chunked write is doing its job" at 1 MB, and the first
+      -- 1 MB pass then came over TLS to hivemq - a path that had carried 200 KB
+      -- BEFORE chunking existed. Whether the chunking is what made 1 MB possible
+      -- is a question for the mosquitto LAN path where a single write failed,
+      -- and for docs/ENGINE-NOTES.md 1.1, not for a line in a test log.
+      ctPass "large payloads round-trip intact up to " & sCtBigOk & " bytes (" \
+            & "writes chunked at " & mqttGetWriteChunkSize() & " bytes)"
       ctNext
       exit ctStageBig
    end if
@@ -500,10 +502,13 @@ end ctRate
 function ctBigSize pStep
    -- Doubling from 4 KB. 64 KB is the first size past a typical socket
    -- buffer; 128 KB is the first whose Remaining Length needs three varint
-   -- bytes; 204800 is where run 4 failed with a single write. The last two
-   -- rungs are the point of the chunked write: 512 KB and 1 MB are well past
-   -- any kernel send buffer, so they round-trip ONLY if the library never
-   -- hands the kernel more than it can take in one send().
+   -- bytes; 131072 and 204800 are where runs 3 and 4 failed with a single
+   -- write on the mosquitto LAN path. The last two rungs exist for the chunked
+   -- write: 512 KB and 1 MB are past any cold kernel send buffer. On the path
+   -- where the single write failed, a 1 MB round trip is the experiment that
+   -- tests the mechanism in docs/ENGINE-NOTES.md 1.1; on a path that carried
+   -- 200 KB before chunking (hivemq, run 2) it shows the ceiling is higher, and
+   -- no more than that.
    switch pStep
       case 1
          return 4096
@@ -770,10 +775,16 @@ end ctSay
 command ctFinish
    put false into sCtRunning
 
-   -- Put the dashboard back the way it was found.
+   -- Put the dashboard back the way it was found. The unsubscribe is
+   -- conditional because a green run has already unsubscribed in its own
+   -- stage; sending a second UNSUBSCRIBE for a filter the table no longer
+   -- lists is legal MQTT, and it also printed an "Unsubscribe confirmed"
+   -- AFTER the RUN FINISHED line, which read as a stage that had run late.
    mqttSetCallbackTarget the long id of this stack
    mqttSetMessageCallback "mdOnMessage"
-   get mqttUnsubscribe(sCtHost, sCtPort, sCtBase & "/#")
+   if mqttGetSubscriptions(sCtHost, sCtPort) contains (sCtBase & "/#") then
+      get mqttUnsubscribe(sCtHost, sCtPort, sCtBase & "/#")
+   end if
 
    ctSay "      " & sCtPass & " passed, " & sCtFail & " failed, " \
          & sCtSkip & " skipped - RUN FINISHED"
