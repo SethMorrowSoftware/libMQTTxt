@@ -1,21 +1,23 @@
 # MQTT Client Library Reference
 
-Version 2.12.7 - OXT MQTT 3.1.1 Implementation
+Version 2.12.8 - OXT MQTT 3.1.1 Implementation
 
-> **Status: eight engine runs recorded 2026-09-05/06.** Compiles and loads on
-> OXT; connects to mosquitto and hivemq, in the clear and over verified TLS; QoS
-> 0/1/2, UTF-8 and binary payloads, retained, unsubscribe, keep-alive and the
-> auto-reconnect back-off are observed working, and payloads to 1 MB round-trip
-> over the internet path.
+> **Status: ten engine runs recorded 2026-09-05/06, the last one fully green -
+> 16 passed, 0 failed.** Compiles and loads on OXT; connects to mosquitto and
+> hivemq, in the clear and over verified TLS. Observed working: QoS 0/1/2 with
+> their acknowledgment legs and exactly-once, UTF-8 and binary payloads,
+> zero-length payloads, retained replay and clear, unsubscribe, keep-alive over
+> 100 s idle, the auto-reconnect back-off, and payloads to 1 MB on two brokers
+> over two networks.
 >
-> **One open defect, cause now isolated:** a **plaintext** publish beyond roughly
-> 64 KB to 400 KB (the point moves with the network path) can stall and reset the
-> connection. Observed against two brokers on two networks in one run, while the
-> same engine carried the same megabyte to one of them over TLS. **TLS is
-> unaffected; use it, or keep plaintext publishes small.** The fix is not settled
-> yet — see `docs/ENGINE-NOTES.md` 1.1. Not yet observed either: a reconnect that
-> succeeds, two connections at once, the persistent store, and certificate
-> verification refusing a bad certificate.
+> **Large writes are rate-limited, by necessity.** The engine's plaintext write
+> stalls if it outruns the link, so a payload larger than the chunk size is paced
+> at `mqttSetWriteChunkSize` / `mqttSetWriteYieldMs` - 320 KB/s at the defaults.
+> Smaller payloads are unaffected. `docs/ENGINE-NOTES.md` 1.1 has the ten runs
+> behind that and the case for asynchronous writes as the eventual fix.
+>
+> **Not yet observed:** a reconnect that succeeds, two connections at once, the
+> persistent store, and certificate verification refusing a bad certificate.
 
 ## Table of Contents
 
@@ -320,21 +322,30 @@ mqttSetWriteYieldMs pMilliseconds
 **Zero is not "no pause".** It is a yield: one turn of the engine's event loop,
 costing pending messages their run and no elapsed time.
 
-**A non-zero value is the current workaround for the large plaintext write
-stall.** The engine's plaintext write hands the kernel one non-blocking send and
-does not retry a socket that is momentarily full, so writing chunks back to back
-at zero pause fills the send buffer faster than the wire drains it and the first
-chunk to meet a full buffer times out (`docs/ENGINE-NOTES.md` 1.1). A pause
-gives the buffer time to drain. It costs the given delay per chunk, so a 1 MB
-payload at 16 KB chunks and 20 ms adds 1.3 seconds.
+**This is a rate limit, and it is what makes a large publish work at all.** The
+engine's plaintext write hands the kernel one non-blocking send and does not
+retry a socket that is momentarily full, so chunks written back to back fill the
+send buffer faster than the wire drains it and the first chunk to meet a full
+buffer times out with the packet half-sent (`docs/ENGINE-NOTES.md` 1.1, ten
+engine runs). The pause keeps the write inside the link's drain rate.
 
-**How much you need depends on your uplink**, which is why there is no
-non-zero default yet. Raise it until your largest publish goes through. TLS
-connections do not need it at all.
+**The arithmetic is chunk ÷ pause.** At the defaults, 16384 bytes per 50 ms =
+320 KB/s. Raise the pause to be safer on a slow uplink; lower it to go faster,
+until it outruns the link and fails. A measured example: a broker over a home
+internet connection stalled at 0, 5 and 20 ms and carried a megabyte at 50.
+
+**Ordinary traffic pays nothing.** A packet that fits one chunk never pauses —
+every control packet, and almost every publish. This only governs payloads
+larger than `mqttGetWriteChunkSize()`.
+
+**To tune it for your own path**, run `examples/mqtt-conformance-button`: its
+first stage ladders the pause upward and reports the fastest value that carries
+a megabyte.
 
 **Example:**
 ```OXT
-mqttSetWriteYieldMs 20   -- then retry the publish that stalled
+mqttSetWriteYieldMs 5    -- a fast LAN: 16384 / 5ms = 3.2 MB/s
+mqttSetWriteYieldMs 200  -- a slow uplink: 80 KB/s, but it gets there
 ```
 
 ---
@@ -929,7 +940,7 @@ function mqttTestLibrary()
 **Example:**
 ```OXT
 put mqttTestLibrary()
--- Returns: "MQTT Library v2.12.7 loaded successfully"
+-- Returns: "MQTT Library v2.12.8 loaded successfully"
 ```
 
 ---

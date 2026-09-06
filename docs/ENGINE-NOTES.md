@@ -398,6 +398,64 @@ produces decides between a paced default and asynchronous writes, which
 self-pace because the engine reports each chunk as it goes. Async is now the
 favourite for the eventual fix; the pacing number tells us how much it is worth.
 
+### The tenth run: pacing is the cure, and the number is measured
+**OBSERVED 2026-09-06.** The ladder ran against broker.hivemq.com:1883 in the
+clear, one megabyte per rung on a fresh connection:
+
+    pause per chunk   result
+    0 ms              timeout after 65536 of 1048615 bytes
+    5 ms              timeout after 65536 of 1048615 bytes
+    20 ms             timeout after 65536 of 1048615 bytes
+    50 ms             PUBACKed, 3287 ms
+
+**65536 bytes, three times, to the byte.** The stall point does not move with
+the pause, only with the path - it is that path's send-buffer capacity, and the
+pause decides whether the buffer is ever driven into it. That is the mechanism
+confirmed by construction rather than inferred: **the write outruns the link,
+and slowing it down fixes it.** Promote the pacing half of 1.1 to OBSERVED. The
+send-and-do-not-retry behaviour inside the engine stays INFERRED - still nobody
+has read the engine's source - but it is now the only reading with no
+competitor.
+
+**Then the pause was kept for the rest of the run, and the whole thing went
+green against mosquitto on the LAN: 16 passed, 0 failed, 1 skipped**, ladder to
+1 MB included, the un-echoed megabyte included, keep-alive across 100 s
+included. The first fully green conformance run of the project.
+
+**And the timings say exactly what the pause costs.** Every rung reports the
+same throughput, on both brokers, on both networks:
+
+    payload      chunks  pauses x 50ms   observed   pause is   real write work
+    65536 B        4        150 ms        216 ms      69%          66 ms
+    131072 B       8        350 ms        420 ms      83%          70 ms
+    204800 B      13        600 ms        626 ms      96%          26 ms
+    524288 B      32       1550 ms       1647 ms      94%          97 ms
+    1048576 B     64       3150 ms       3289 ms      96%         139 ms
+
+Actual write work is 26-139 ms whatever the size; the rest is the pause. The
+"311 KB/s" every rung reports is not the network - it is 16384 bytes / 50 ms =
+320 KB/s, the rate the pause permits, and nothing else. A megabyte's worth of
+real writing took 139 ms, so **the LAN could carry this an order of magnitude
+faster and the pause is throwing that away.**
+
+**Which is the argument for the eventual fix.** The required pause is set by the
+slowest link an application uses: this operator's uplink sits somewhere between
+320 KB/s (works) and 800 KB/s (fails), while their LAN is far quicker. One fixed
+number cannot serve both, and a default must be safe, so v2.12.8 defaults to 50
+and documents the cost. **Asynchronous writes are the right answer** - the
+engine reports each chunk as it is actually written, so the next one goes when
+the socket is ready, at exactly the link's rate with no guessing and no waste.
+That is a real change: it needs a per-connection outbound queue so a control
+packet cannot jump ahead of a queued publish, and it changes what `mqttPublish`
+returning `OK` means from "written" to "queued". Worth doing, worth doing
+carefully, and not worth bolting onto a run that just went green.
+
+**Also OBSERVED this run:** a CONNECT to a routable address with nothing
+listening produced `ERROR sending CONNECT: socket closed after 0 of 30 bytes` -
+the engine accepted `open socket`, the peer closed, and the write check caught
+it on the CONNECT itself with an exact byte count. The 2.12.1 write check
+working on the one packet that had never exercised it.
+
 ### 1.4 A DISCONNECT written just before `close socket` may not reach the broker
 **INFERRED (2026-09-06), not yet observed, recorded so it is not lost.**
 
@@ -791,6 +849,32 @@ either (2.1). Two stacks, two sessions, same shape.
 chunks, under a re-entrancy lock, and the conformance run gets a stage that
 publishes 1 MB to a topic nothing echoes back - the experiment that tells the
 echo stall apart from a broken write path. Both are in the next run.
+
+### Tenth run, 2026-09-06, OXT + broker.hivemq.com then mosquitto, v2.12.7
+
+**16 passed, 0 failed, 1 skipped - the first fully green conformance run.** The
+pacing ladder found 50 ms per chunk, kept it, and every stage that had ever
+failed then passed against the LAN broker (1.1).
+
+**Newly OBSERVED:**
+
+- **Pacing is the cure.** 0, 5 and 20 ms all stalled at exactly 65536 bytes;
+  50 ms carried a megabyte. The stall point is the path's buffer; the pause
+  decides whether it is ever filled.
+- **The whole protocol surface, green in one run:** SUBSCRIBE/SUBACK, QoS 0/1/2
+  with ack legs and exactly-once, UTF-8 and all 256 byte values, a megabyte both
+  echoed and un-echoed, the full size ladder, retained replay and clear,
+  unsubscribe with the negative check, and keep-alive across 100 s idle.
+- **What the pause costs**, from the per-rung timings: 94-96% of the elapsed
+  time on large payloads. Real write work is 26-139 ms regardless of size.
+- **The write check on CONNECT**: a connect to a routable address with nothing
+  listening reported `socket closed after 0 of 30 bytes`.
+
+**Not tested, still:** `kCtHost2` was empty so multi-connection skipped again;
+the persistent store; a reconnect that succeeds; certificate verification
+refusing a bad certificate. `preOpenStack` did not fire because the script was
+applied to an open stack rather than reopened, which is 2.1 behaving as
+documented.
 
 ### Ninth run, 2026-09-06, OXT + mosquitto AND broker.hivemq.com, both :1883, v2.12.7
 

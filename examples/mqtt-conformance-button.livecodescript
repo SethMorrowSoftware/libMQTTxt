@@ -67,6 +67,14 @@ constant kCtPort2 = 1883
 -- It runs FIRST because a stall later resets the connection and aborts the
 -- rest, which is exactly when this answer is wanted. Set kCtAltHost to empty
 -- to skip it.
+--
+-- THE PAUSE IT FINDS BELONGS TO THIS PATH, not to yours. A public broker over a
+-- home uplink needs far more pacing than a broker on the same LAN, so a value
+-- measured against hivemq is conservative for a local deployment. To measure
+-- YOUR broker instead, point kCtAltHost at it by a second address the same way
+-- kCtHost2 does - "127.0.0.1" while the form says "localhost", or its hostname
+-- while the form has its IP. The library keys connections by "host:port", so a
+-- different spelling is a different connection and the stage will not refuse it.
 constant kCtAltHost = "broker.hivemq.com"
 constant kCtAltPort = 1883
 constant kCtAltSize = 1048576

@@ -98,13 +98,23 @@ command mqttInitialize
    -- write path exists to prevent. Cleared here, never carried across a session.
    put empty into gMQTTWriteLocks
 
-   -- How long __writeSocket yields between chunks. Zero is one turn of the
-   -- event loop and no elapsed time, which is what a yield is for. It is
-   -- settable because the eighth engine run left one hypothesis standing that
-   -- a NON-zero value would test: that the engine needs real time, not just a
-   -- turn, to drain what it has accepted. See mqttSetWriteYieldMs.
+   -- How long __writeSocket pauses between chunks of a large write.
+   --
+   -- 50 IS A MEASURED VALUE, NOT A GUESS, and it is deliberately conservative.
+   -- The tenth engine run laddered 0, 5, 20 and 50 ms against a broker over
+   -- the internet: the first three stalled at exactly 65536 bytes every time
+   -- and 50 carried a megabyte. The pause is what keeps the write from
+   -- outrunning the link (docs/ENGINE-NOTES.md 1.1), so the safe value is set
+   -- by the SLOWEST link an application uses, and a default that is wrong is
+   -- better wrong slow than wrong broken.
+   --
+   -- It costs nothing for ordinary traffic: a packet that fits one chunk never
+   -- pauses at all, which is every control packet and almost every publish.
+   -- It caps a MULTI-chunk write at chunk/pause = 320 KB/s. On a LAN that is
+   -- far below what the link can do; lower it, or raise the chunk size, once
+   -- you have measured your own path.
    if gMQTTWriteYieldMs is empty then
-      put 0 into gMQTTWriteYieldMs
+      put 50 into gMQTTWriteYieldMs
    end if
 
    put true into gMQTTInitialized
@@ -232,21 +242,28 @@ function mqttGetWriteChunkSize
    return gMQTTWriteChunkSize
 end mqttGetWriteChunkSize
 
--- How long a large write pauses between chunks, in milliseconds.
+-- How long a large write pauses between chunks, in milliseconds. Default 50.
 --
--- ZERO IS NOT "NO PAUSE", it is a yield: one turn of the engine's event loop,
--- costing pending messages their run and no elapsed time. That is what breaks
--- a stall caused by nothing servicing the inbound side.
+-- THIS IS A RATE LIMIT, and it is the difference between a large publish
+-- working and failing. The engine's plaintext write hands the kernel one
+-- non-blocking send and does not retry a socket that is momentarily full, so a
+-- write that outruns the link fills the send buffer and the next chunk times
+-- out with the stream half-sent (docs/ENGINE-NOTES.md 1.1, ten engine runs).
+-- The pause is what keeps the write inside the link's drain rate.
 --
--- A NON-ZERO VALUE IS A DIAGNOSTIC, and the eighth engine run is why it is
--- reachable from script. A large write still stalled on one path with the
--- yield in place and with no inbound traffic at all to explain it
--- (docs/ENGINE-NOTES.md 1.1). One reading still standing is that the engine
--- needs real elapsed time - not merely a turn of the loop - to push what it
--- has already accepted. Setting this to 20 or 50 tests that reading without
--- editing the library. It costs that many milliseconds per chunk, so a 1 MB
--- payload at 16 KB chunks and 20 ms is 1.3 seconds of deliberate delay: a
--- measurement, not a setting to leave on.
+-- THE ARITHMETIC IS chunk / pause. At the defaults that is 16384 bytes per
+-- 50 ms, so 320 KB/s. Raise this and a large write goes slower and is safer on
+-- a slow uplink; lower it and it goes faster until it outruns the link and
+-- fails. The tenth run measured a broker over the internet stalling at 0, 5
+-- and 20 ms and succeeding at 50.
+--
+-- ORDINARY TRAFFIC PAYS NOTHING. A packet that fits one chunk never pauses -
+-- every control packet, and almost every publish. This only ever governs a
+-- payload larger than mqttGetWriteChunkSize().
+--
+-- TO TUNE IT for your own path, run examples/mqtt-conformance-button: its
+-- first stage ladders the pause upward and reports the fastest one that
+-- carries a megabyte.
 command mqttSetWriteYieldMs pMilliseconds
    if pMilliseconds is not a number or pMilliseconds < 0 then
       __mqttLog "ERROR: Write yield must be a non-negative number; keeping" \
@@ -911,7 +928,7 @@ command mqttCleanupAll
 end mqttCleanupAll
 
 function mqttTestLibrary
-   return "MQTT Library v2.12.7 loaded successfully"
+   return "MQTT Library v2.12.8 loaded successfully"
 end mqttTestLibrary
 
 function mqttSelfTest
@@ -1044,7 +1061,7 @@ function mqttSelfTest
    -- Summary
    put "MQTT Library Self-Test" & return into tResults
    put "=====================" & return after tResults
-   put "Version: 2.12.7" & return after tResults
+   put "Version: 2.12.8" & return after tResults
    put "Passed:" && tPassed & return after tResults
    put "Failed:" && tFailed & return after tResults
 
@@ -1820,7 +1837,7 @@ end __maxBufferSize
 -- depend on a host having called an initialiser.
 private function __writeYieldMs
    if gMQTTWriteYieldMs is not a number or gMQTTWriteYieldMs < 0 then
-      return 0
+      return 50
    end if
    return gMQTTWriteYieldMs
 end __writeYieldMs
