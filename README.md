@@ -532,7 +532,41 @@ MQTT 3.1.1 Specification Implementation:
 
 ## Version History
 
-### 2.12.8 (Current)
+### 2.13.0 (Current)
+
+**Writes are asynchronous.** The fix that runs 7 through 10 pointed at, built.
+
+- **Every packet goes through a per-connection outbound queue**, written one
+  chunk at a time, each chunk started only when the engine reports the previous
+  one done. That is self-pacing: the queue drains at exactly the rate the socket
+  accepts, with no delay to guess at. It replaces the fixed 50 ms pause that
+  worked but capped large writes at 320 KB/s while the real write work for a
+  megabyte was ~139 ms.
+- **Every packet, not just the large ones**, because that is what makes it safe.
+  A PINGREQ written directly while a megabyte of PUBLISH sat half-queued would
+  land *inside* that publish and desynchronise the broker's framing for good.
+  One queue per socket, strictly FIFO, one chunk in flight — there is no direct
+  path, and a static gate enforces that only the pump may start a write.
+- **`mqttPublish` returning `OK` now means queued, not written.** A failure
+  after that point arrives through the state-change callback with
+  `disconnected` and a reason. For QoS 1 and 2 the acknowledgment was always the
+  real proof of delivery. `mqttGetQueuedBytes` reports what is still owed.
+- **Backpressure:** a packet that would take the queue past the buffer ceiling
+  is refused, rather than growing it until the engine runs out of memory.
+- **`DISCONNECT` is still written synchronously**, after dropping the queue. A
+  queued one would be discarded by the `close socket` on the next line and every
+  clean disconnect would fire the Last Will.
+- **`mqttSetAsyncWrites false`** falls back to the 2.12.8 paced synchronous path
+  in one line — the way back if this misbehaves on your engine.
+- **New gate:** `tools/test-write-queue.py` transcribes the queue's state
+  machine and drives it through the sequences that would break ordering —
+  interleaved enqueues, an enqueue arriving during a write, a chunk-size change
+  mid-flight, a socket closing mid-packet. That last-but-one case caught a real
+  defect in the first draft before it ever ran.
+
+**Not yet run on an engine.** Verified statically; needs an OXT pass.
+
+### 2.12.8
 
 From the tenth engine run — **the first fully green conformance run: 16 passed,
 0 failed.**

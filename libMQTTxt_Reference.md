@@ -1,6 +1,6 @@
 # MQTT Client Library Reference
 
-Version 2.12.8 - OXT MQTT 3.1.1 Implementation
+Version 2.13.0 - OXT MQTT 3.1.1 Implementation
 
 > **Status: fourteen engine runs recorded 2026-09-05/06, the best one 17 passed,
 > 0 failed.** Compiles and loads on OXT; connects to mosquitto and hivemq, in the
@@ -10,11 +10,13 @@ Version 2.12.8 - OXT MQTT 3.1.1 Implementation
 > **two simultaneous connections with independent keep-alive chains**, the
 > auto-reconnect back-off, and payloads to 1 MB on two brokers over two networks.
 >
-> **Large writes are rate-limited, by necessity.** The engine's plaintext write
-> stalls if it outruns the link, so a payload larger than the chunk size is paced
-> at `mqttSetWriteChunkSize` / `mqttSetWriteYieldMs` - 320 KB/s at the defaults.
-> Smaller payloads are unaffected. `docs/ENGINE-NOTES.md` 1.1 has the ten runs
-> behind that and the case for asynchronous writes as the eventual fix.
+> **Writes are asynchronous as of 2.13.0** - queued per connection and written a
+> chunk at a time as the engine reports each one done, which paces them at the
+> link's own rate. `mqttPublish` returning "OK" therefore means QUEUED; the
+> acknowledgment is what proves delivery. `mqttSetAsyncWrites false` falls back
+> to the paced synchronous path of 2.12.8. **This path has not yet run on an
+> engine** - `docs/ENGINE-NOTES.md` section 4 has the design, the risk it
+> carries, and what a run has to show.
 >
 > **Not yet observed:** a reconnect that succeeds, the persistent store, and
 > certificate verification refusing a bad certificate.
@@ -352,13 +354,94 @@ mqttSetWriteYieldMs 200  -- a slow uplink: 80 KB/s, but it gets there
 
 ### mqttGetWriteYieldMs
 
-Get the current inter-chunk yield in milliseconds.
+Get the current inter-chunk yield in milliseconds. Only consulted when
+asynchronous writes are off.
 
 ```OXT
 put mqttGetWriteYieldMs() into tMs
 ```
 
 **Returns:** Integer
+
+---
+
+### mqttSetAsyncWrites
+
+Choose how packets reach the socket. Asynchronous is the default.
+
+```OXT
+mqttSetAsyncWrites pEnabled
+```
+
+**Parameters:**
+- `pEnabled` - `true` (default) for the outbound queue, `false` for the paced
+  synchronous path of 2.12.8
+
+**Asynchronous (the default).** A packet is appended to a per-connection queue
+and written one chunk at a time, each chunk started only when the engine reports
+the previous one written. The queue drains at exactly the rate the socket
+accepts — no pause to guess at, and no ceiling. Ordering is guaranteed because
+*every* packet goes through the queue: a control packet can never overtake a
+publish that is half-written.
+
+**What it changes for you:** `mqttPublish` returning `"OK"` means the packet is
+**queued**, not that its bytes are on the wire. A write that fails after that
+point cannot be returned to you, so it arrives the way any mid-connection
+failure does — the state-change callback with `disconnected` and a reason. For
+QoS 1 and 2 the acknowledgment is the real proof of delivery, and always was.
+
+**Synchronous (`false`).** The pre-2.13.0 path: chunks written back to back with
+`mqttSetWriteYieldMs` between them. Slower for large payloads and it blocks the
+engine while it runs, but a write failure comes straight back from
+`mqttPublish`. Use it if you depend on that, or as the way back if asynchronous
+writes misbehave on your engine.
+
+`DISCONNECT` is written synchronously either way — a queued one would be
+discarded by the socket close that follows it, and the broker would publish the
+Last Will on a clean exit.
+
+**Example:**
+```OXT
+mqttSetAsyncWrites false   -- back to the 2.12.8 paced path
+```
+
+---
+
+### mqttGetAsyncWrites
+
+Whether writes are asynchronous.
+
+```OXT
+put mqttGetAsyncWrites() into tAsync
+```
+
+**Returns:** `true` or `false`
+
+---
+
+### mqttGetQueuedBytes
+
+How many bytes are queued for a connection and not yet written.
+
+```OXT
+put mqttGetQueuedBytes(pHost, pPort) into tBytes
+```
+
+**Returns:** Integer; `0` when everything handed to the library has reached the
+socket, and always `0` under synchronous writes.
+
+**Use it to pace an application that produces faster than its link can carry.**
+A packet that would take the queue past `mqttSetMaxBufferSize` is refused
+outright, so a producer that ignores this will eventually see
+`ERROR: the outbound queue is full`.
+
+**Example:**
+```OXT
+if mqttGetQueuedBytes(tHost, tPort) > 1048576 then
+   -- let the link catch up before adding more
+   exit publishNextFrame
+end if
+```
 
 ---
 
@@ -940,7 +1023,7 @@ function mqttTestLibrary()
 **Example:**
 ```OXT
 put mqttTestLibrary()
--- Returns: "MQTT Library v2.12.8 loaded successfully"
+-- Returns: "MQTT Library v2.13.0 loaded successfully"
 ```
 
 ---

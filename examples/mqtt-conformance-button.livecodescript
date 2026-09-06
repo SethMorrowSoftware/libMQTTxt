@@ -108,6 +108,7 @@ local sCtHoldEnd, sCtKey2
 local sCtPhase           -- sub-state within a multi-step stage
 local sCtBigStep, sCtBigOk   -- the large-payload ladder's position and high-water mark
 local sCtWriteMs             -- how long the current rung's write call took
+local sCtT0                  -- when the current rung was published, for the ack time
 local sCtProbeStep           -- the pacing ladder's position in kCtYieldLadder
 local sCtEndedEarly          -- why the run stopped before its last stage, if it did
 
@@ -194,7 +195,16 @@ command ctBegin
    -- value belongs in the record beside any size that fails.
    ctSay "   socketTimeoutInterval " & the socketTimeoutInterval & "ms"
    ctSay "   write chunk size " & mqttGetWriteChunkSize() & " bytes"
-   ctSay "   write yield " & mqttGetWriteYieldMs() & "ms per chunk"
+   -- WHICH WRITE PATH IS RUNNING changes what the timings below MEAN. Under
+   -- asynchronous writes a publish returns as soon as it is queued, so the
+   -- "write call" is an enqueue and the honest measure of throughput is the
+   -- time to the broker's acknowledgment. Both are printed.
+   if mqttGetAsyncWrites() then
+      ctSay "   writes ASYNCHRONOUS (queued; the ack time is the real measure)"
+   else
+      ctSay "   writes synchronous, paced " & mqttGetWriteYieldMs() \
+            & "ms per chunk"
+   end if
 
    send "ctTick" to me in kCtTickMs milliseconds
 end ctBegin
@@ -365,6 +375,7 @@ command ctStageAltWrite
       case 2
          put ctPayload(kCtAltSize) into sCtBig
          put the milliseconds into tT0
+         put tT0 into sCtT0
          put mqttPublish(kCtAltHost, kCtAltPort, \
                "libmqttxt/ctprobe/" & the milliseconds, sCtBig, 1, false) into tRc
          put the milliseconds - tT0 into tWriteMs
@@ -387,9 +398,10 @@ command ctStageAltWrite
          put mqttGetConnectionInfo(kCtAltHost, kCtAltPort) into tInfo
          if tInfo["pendingAcks"] is empty then
             ctPass kCtAltSize & " bytes in the clear to " & kCtAltHost \
-                  & " at a " & tYield & "ms pause per chunk, PUBACKed (write " \
-                  & "call " & sCtWriteMs & "ms, " \
-                  & ctRate(kCtAltSize, sCtWriteMs) & ")"
+                  & " at a " & tYield & "ms pause per chunk, PUBACKed in " \
+                  & (the milliseconds - sCtT0) & "ms (" \
+                  & ctRate(kCtAltSize, the milliseconds - sCtT0) \
+                  & "; the write call itself took " & sCtWriteMs & "ms)"
             if tYield is 0 then
                ctSay "      NOTE: no pacing needed on this path - the engine " \
                      & "wrote a megabyte of plaintext straight through. A " \
@@ -627,6 +639,7 @@ command ctStageNoEcho
       put ctPayload(tSize) into sCtBig
 
       put the milliseconds into tT0
+      put tT0 into sCtT0
       put mqttPublish(sCtHost, sCtPort, sCtQuiet & "/big", sCtBig, 1, false) \
             into tRc
       put the milliseconds - tT0 into tWriteMs
@@ -646,8 +659,9 @@ command ctStageNoEcho
 
    put mqttGetConnectionInfo(sCtHost, sCtPort) into tInfo
    if tInfo["pendingAcks"] is empty then
-      ctPass tLabel & " was PUBACKed (write call " & sCtWriteMs & "ms, " \
-            & ctRate(tSize, sCtWriteMs) & ")"
+      ctPass tLabel & " was PUBACKed in " & (the milliseconds - sCtT0) & "ms (" \
+            & ctRate(tSize, the milliseconds - sCtT0) \
+            & "; write call " & sCtWriteMs & "ms)"
       ctNext
       exit ctStageNoEcho
    end if
@@ -703,6 +717,7 @@ command ctStageBig
 
    if not sCtEntered then
       put ctPayload(tSize) into sCtBig
+      put the milliseconds into sCtT0
 
       -- TIME THE WRITE. This is the measurement that separates the two
       -- explanations for a size that fails: if the write time grows roughly
@@ -737,8 +752,14 @@ command ctStageBig
          add 1 to sCtBigStep
          put 0 into sCtTicks
          put false into sCtEntered
-         ctSay "      " & tSize & " bytes round-tripped intact (write call " \
-               & sCtWriteMs & "ms, " & ctRate(tSize, sCtWriteMs) & ")"
+         -- THE ROUND TRIP is the number that means the same thing on both
+         -- write paths: published, carried by the broker, and back. The write
+         -- call is printed beside it because under asynchronous writes it is
+         -- an enqueue and the gap between the two is the point.
+         ctSay "      " & tSize & " bytes round-tripped intact in " \
+               & (the milliseconds - sCtT0) & "ms (" \
+               & ctRate(tSize, the milliseconds - sCtT0) \
+               & "; write call " & sCtWriteMs & "ms)"
       else
          ctFail "large payload at " & tSize & " bytes", "got back " \
                & the number of bytes of tGot & " bytes"

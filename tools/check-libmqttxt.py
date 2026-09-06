@@ -343,9 +343,11 @@ def check_socket_writes_are_checked(lines, problems):
         if handler_end(stripped):
             current = None
             continue
-        # The one legitimate bare write: the helper everything else routes
-        # through. Exempted by NAME, so the exemption cannot quietly widen.
-        if current == "__writeSocket":
+        # The two legitimate bare writes: the synchronous helper and the
+        # asynchronous one. Both check the throw AND `the result`; everything
+        # else routes through __writeSocket, which picks between them.
+        # Exempted by NAME, so the exemption cannot quietly widen.
+        if current in ("__writeSocketSync", "__writeSocketAsync"):
             continue
         if re.search(r"^\s*write\b.*\bto\s+socket\b", stripped):
             problems.append(
@@ -414,13 +416,49 @@ def check_reentrant_waits(lines, problems):
             continue
         if not re.search(r"\bwait\b.*\bwith\s+messages\b", stripped):
             continue
-        if current == "__writeSocket":
+        if current == "__writeSocketSync":
             continue
         problems.append(
             "%d: `wait ... with messages` in `%s`. A yield runs application "
             "code inside this handler, which can re-enter the library; only "
             "__writeSocket is written to survive that (it holds a per-socket "
             "lock across its yields)." % (n, current or "<script level>"))
+
+
+def check_async_writes_are_queued(lines, problems):
+    """An asynchronous write may only be started by the queue's pump.
+
+    `write ... with message` hands bytes to the engine and returns immediately,
+    so two of them in flight on one socket interleave on the wire. A PINGREQ
+    started while a megabyte of PUBLISH is half-written lands INSIDE that
+    publish and desynchronises the stream for good - the same corruption a
+    stalled synchronous write used to cause, arrived at from the other side.
+
+    The queue is what makes that impossible: one chunk in flight per socket,
+    strictly FIFO, the next started only when the engine reports the last one
+    done. That guarantee holds only while __pumpWriteQueue is the sole caller
+    of __writeSocketAsync, which is what this rule enforces.
+    """
+    current = None
+    for n, raw in enumerate(lines, 1):
+        stripped = strip_noise(raw)
+        m = HANDLER_RE.match(stripped)
+        if m:
+            current = m.group(3)
+            continue
+        if handler_end(stripped):
+            current = None
+            continue
+        if not re.search(r"\b__writeSocketAsync\s*\(", stripped):
+            continue
+        if current in ("__pumpWriteQueue", "__writeSocketAsync"):
+            continue
+        problems.append(
+            "%d: `__writeSocketAsync` called from `%s`. Only __pumpWriteQueue "
+            "may start an asynchronous write - a second one in flight on the "
+            "same socket interleaves with the first and corrupts the stream. "
+            "Queue the packet with __enqueueWrite instead."
+            % (n, current or "<script level>"))
 
 
 def check_per_byte_reads(lines, problems):
@@ -460,6 +498,7 @@ def main():
     check_no_control_references(lines, problems)
     check_socket_writes_are_checked(lines, problems)
     check_reentrant_waits(lines, problems)
+    check_async_writes_are_queued(lines, problems)
 
     if problems:
         for p in problems:

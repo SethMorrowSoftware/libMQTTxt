@@ -438,6 +438,10 @@ Actual write work is 26-139 ms whatever the size; the rest is the pause. The
 real writing took 139 ms, so **the LAN could carry this an order of magnitude
 faster and the pause is throwing that away.**
 
+**BUILT IN 2.13.0, and the argument for it is below.** The pacing default of
+50 ms stays as the fallback path; asynchronous writes replace it as the default.
+The design and its one risk are in section 4.
+
 **Which is the argument for the eventual fix.** The required pause is set by the
 slowest link an application uses: this operator's uplink sits somewhere between
 320 KB/s (works) and 800 KB/s (fails), while their LAN is far quicker. One fixed
@@ -984,3 +988,102 @@ third guess at a fix.
   subscription live alongside the run. The re-entrancy lock cost nothing
   observable.
 - **`__failWrite` and the abort path**, for the fourth and fifth time.
+
+---
+
+## 4. The asynchronous write path (2.13.0)
+
+**DESIGNED FROM RUNS 7-10, NOT YET RUN ON AN ENGINE.** Everything here is
+`verified statically; needs an OXT pass`. The gates behind it are
+`tools/test-write-queue.py` (the ordering property, nine cases) and rule 13 of
+`tools/check-libmqttxt.py` (only the pump may start an asynchronous write).
+
+### Why
+
+Section 1.1 ends with a measured cure and a bad bargain: a fixed pause per chunk
+keeps a large write inside the link's drain rate, and the tenth run showed that
+pause accounting for 94-96% of a megabyte's elapsed time. The pause has to be
+sized for the slowest link an application will ever use, so a LAN pays for an
+uplink it never touches.
+
+The engine will instead report each write as it completes. A chunk started only
+on that report cannot outrun anything: the queue drains at exactly the rate the
+socket accepts. That is the same cure with the guesswork removed.
+
+### The shape
+
+One queue per socket, in its own global - never in the connection record, since
+application code running during a callback can call `mqttCleanupAll`, and
+writing a key back into a deleted record recreates it as a zombie the keep-alive
+sweep walks forever (the lesson `__parseIncomingData` already carries).
+
+    __writeSocket        picks the path; every caller still uses only this
+      __enqueueWrite     appends, then pumps
+      __writeSocketSync  the 2.12.8 paced path, kept as the fallback
+    __pumpWriteQueue     starts ONE chunk if none is in flight
+    mqttSocketWriteDone  the engine's report; advances and pumps again
+    __dropWriteQueue     teardown, and before any synchronous DISCONNECT
+
+### The one risk, and what holds it
+
+**Two writes in flight on one socket interleave on the wire.** A PINGREQ started
+while a megabyte of PUBLISH is half-written lands *inside* that publish; the
+broker's framing desynchronises and never recovers, and neither side reports an
+error. It is the same corruption a stalled synchronous write used to cause,
+reached from the opposite direction.
+
+What prevents it is that **every** packet goes through the queue - not just the
+large ones - and the queue is strictly FIFO with at most one chunk outstanding.
+There is no direct path. Rule 13 of the static gate enforces that
+`__pumpWriteQueue` is the only caller of `__writeSocketAsync`, so the guarantee
+cannot be eroded by a later change that "just needs to send a PINGREQ now".
+
+Two subtler cases the model checks:
+
+- **An enqueue during a write.** A message callback that publishes runs while a
+  chunk is in flight. It appends and returns; the packet waits its turn.
+- **`mqttSetWriteChunkSize` called between a write and its completion.** The
+  completion must advance by the size actually written, so the pump records it
+  in `inflight` rather than letting the completion recompute it. Recomputing
+  leaves `pos` on the wrong byte and sends the packet's tail from the wrong
+  offset - silently. This was a real defect in the first draft, caught by
+  reading rather than by a run, and it is now a test case.
+
+### What it changes for a caller
+
+`mqttPublish` returning `OK` means **queued**, not written. A write that fails
+after that point cannot be returned to the caller, so it arrives the way any
+mid-connection failure does: the state-change callback with `disconnected` and a
+reason. For QoS 1 and 2 the acknowledgment was always the real proof of
+delivery; for QoS 0 the guarantee never existed. `mqttGetQueuedBytes` reports
+what is still owed to a socket.
+
+### Backpressure
+
+An application that publishes faster than its link can carry would grow the
+queue until the engine runs out of memory, and that failure lands nowhere near
+its cause. `__enqueueWrite` refuses a packet that would take the queue past
+`__maxBufferSize()` - the same ceiling that guards the inbound direction.
+
+### DISCONNECT stays synchronous
+
+Both teardown paths drop the queue and write DISCONNECT with
+`__writeSocketSync`. A queued DISCONNECT would be discarded by the `close
+socket` on the next line, the broker would see a bare TCP close, and **every
+clean disconnect would publish the Last Will** (1.4). `mqttCleanupAll` is the
+starkest case: no turn of the event loop ever follows it, so a queued write
+would never run at all. Anything still queued at that moment is abandoned
+deliberately and logged; a QoS 1 or 2 message among it is still in `pendingAcks`.
+
+### What the next run has to show
+
+1. **The conformance run still passes**, in the same shape as run 11's 17 of 17.
+   Ordering is the risk; a broken queue shows up as a stalled or nonsensical
+   stage, not as a slow one.
+2. **The ack times.** Under 2.12.8 every rung reported ~311 KB/s because the
+   pause set it. If the queue works, the megabyte's time-to-PUBACK should fall
+   towards the ~139 ms of real write work the tenth run measured. The
+   conformance button now prints time-to-acknowledgment beside the write call
+   for exactly this comparison.
+3. **`mqttSetAsyncWrites false`** must still behave like 2.12.8. If asynchronous
+   writes misbehave, that one line is the way back without pinning a version.
