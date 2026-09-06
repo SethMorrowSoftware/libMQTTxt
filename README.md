@@ -484,7 +484,31 @@ MQTT 3.1.1 Specification Implementation:
 
 ## Version History
 
-### 2.12.3 (Current)
+### 2.12.4 (Current)
+
+From the fifth engine run, the first on a fresh engine session, and the first
+time the boot self-check failed for a real reason.
+
+- **The library initialises itself before touching the network.** Every earlier
+  run had inherited populated globals from a standalone-library session in the
+  same engine, so the embedded initialisation path had never actually been
+  exercised. On a fresh engine the demo's `preOpenStack` did not take effect
+  and the boot check reported the keep-alive threshold empty. Had a connection
+  succeeded, the first inbound byte would have been torn down as a buffer
+  overflow: an empty ceiling compares as text, and any number is greater than
+  `""`. `mqttConnect` now calls `mqttInitialize` if it has not run, and the
+  buffer ceiling is read through a guarded accessor. `mqttInitialize` from
+  `preOpenStack` is still the right thing for an embedder to do; it is no
+  longer the only thing standing between the host and empty globals.
+- **The demo's boot check asks two questions where it asked one**: did
+  `preOpenStack` fire, and is the library initialised. The combined line failed
+  and it took the log's first line to work out which half.
+- The demo also calls `mqttInitialize` from its start handler, and logs a hint
+  when port 8883 is used without TLS, which is what the fifth run tried.
+- `docs/ENGINE-NOTES.md` gains a Lifecycle section (2.1, 2.2). The engine's
+  `socketClosed` reaching the library is now observed, not argued.
+
+### 2.12.3
 
 The write path, settled by the fourth engine run and an independent analysis of
 all four. See `docs/ENGINE-NOTES.md` 1.1 for the evidence.

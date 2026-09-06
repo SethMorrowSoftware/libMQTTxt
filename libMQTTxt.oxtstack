@@ -24,6 +24,7 @@ global gMQTTKeepAliveThreshold    -- When to send PINGREQ (0-1, default 0.75 = 7
 global gMQTTTimerTokens           -- Maps a numeric timer token to its connection ID
 global gMQTTTimerSeq              -- Monotonic counter that mints timer tokens
 global gMQTTWriteChunkSize        -- Largest single write handed to the kernel (bytes)
+global gMQTTInitialized           -- true once mqttInitialize has run in this engine session
 
 -- ========================================
 -- LIBRARY INITIALIZATION
@@ -87,6 +88,8 @@ command mqttInitialize
    if gMQTTWriteChunkSize is empty then
       put 16384 into gMQTTWriteChunkSize
    end if
+
+   put true into gMQTTInitialized
 end mqttInitialize
 
 on libraryStack
@@ -233,6 +236,10 @@ end mqttSetPersistentStore
 -- ========================================
 
 function mqttConnect pHost, pPort, pClientID, pUsername, pPassword, pKeepAlive, pUseTLS, pCleanSession, pLWTTopic, pLWTMessage, pLWTQoS, pLWTRetain, pVerifyTLS, pAutoReconnect, pCACertPath
+   -- Whatever the host did or did not do at open time, nothing below runs
+   -- against empty globals. See __ensureInit for the run that made this rule.
+   __ensureInit
+
    -- Validate the address BEFORE it is used to key anything: every table in this
    -- library is indexed by "host:port", so an empty host would mint the key
    -- ":1883" and quietly alias every other portless caller onto one record.
@@ -851,7 +858,7 @@ command mqttCleanupAll
 end mqttCleanupAll
 
 function mqttTestLibrary
-   return "MQTT Library v2.12.3 loaded successfully"
+   return "MQTT Library v2.12.4 loaded successfully"
 end mqttTestLibrary
 
 function mqttSelfTest
@@ -984,7 +991,7 @@ function mqttSelfTest
    -- Summary
    put "MQTT Library Self-Test" & return into tResults
    put "=====================" & return after tResults
-   put "Version: 2.12.3" & return after tResults
+   put "Version: 2.12.4" & return after tResults
    put "Passed:" && tPassed & return after tResults
    put "Failed:" && tFailed & return after tResults
 
@@ -1645,6 +1652,34 @@ end __captureCallbackTarget
 -- The PINGREQ threshold, guarded. libraryStack sets the global, but a handler
 -- reached before initialisation would otherwise multiply by empty - which is
 -- zero, and a zero threshold means "ping constantly".
+-- THE LIBRARY INITIALISES ITSELF BEFORE IT TOUCHES THE NETWORK.
+--
+-- Fifth engine run, 2026-09-06: a fresh engine session opened the demo and its
+-- boot self-check reported the keep-alive threshold EMPTY - the embedding
+-- stack's preOpenStack had not initialised the library. Every earlier run had
+-- inherited populated globals from a standalone-library session in the same
+-- engine, so the embedded initialisation path had never actually been
+-- exercised. Had that connection succeeded, the first inbound byte would have
+-- met `the number of bytes of tBuffer > gMQTTMaxBufferSize` with an EMPTY
+-- limit - a string comparison that is always true - and been torn down as a
+-- buffer overflow. A library must not have a failure mode that depends on the
+-- host calling one line in one specific handler; this is the backstop.
+private command __ensureInit
+   if gMQTTInitialized is not true then
+      mqttInitialize
+   end if
+end __ensureInit
+
+-- The receive-buffer ceiling, guarded like the keep-alive threshold below and
+-- for the same reason: an empty global compares as text, and "always true" on
+-- an overflow check tears down every connection on its first byte.
+private function __maxBufferSize
+   if gMQTTMaxBufferSize is not a number or gMQTTMaxBufferSize < 1 then
+      return 5242880
+   end if
+   return gMQTTMaxBufferSize
+end __maxBufferSize
+
 private function __keepAliveThreshold
    if gMQTTKeepAliveThreshold is not a number then
       return 0.75
@@ -2409,7 +2444,7 @@ private command __parseIncomingData pConnID, pData
    put gMQTTConnections[pConnID]["receiveBuffer"] into tBuffer
 
    -- Buffer overflow protection
-   if the number of bytes of tBuffer > gMQTTMaxBufferSize then
+   if the number of bytes of tBuffer > __maxBufferSize() then
       __mqttLog "CRITICAL: Buffer overflow (" & the number of bytes of tBuffer && "bytes)"
       __cleanupConnection pConnID, "buffer overflow"
       __handleReconnect pConnID
@@ -2444,9 +2479,9 @@ private command __parseIncomingData pConnID, pData
       -- after buffering it. The overflow guard above only fires once the bytes
       -- have actually arrived, so a broker (or anything posing as one)
       -- announcing a 256 MB packet could hold the buffer growing until then.
-      if tPacketSize > gMQTTMaxBufferSize then
+      if tPacketSize > __maxBufferSize() then
          __mqttLog "CRITICAL: Declared packet size" && tPacketSize && \
-               "exceeds buffer limit" && gMQTTMaxBufferSize
+               "exceeds buffer limit" && __maxBufferSize()
          __cleanupConnection pConnID, "oversized packet"
          __handleReconnect pConnID
          exit __parseIncomingData
