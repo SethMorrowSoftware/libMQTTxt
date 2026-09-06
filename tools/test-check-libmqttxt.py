@@ -110,6 +110,15 @@ CASES = [
                          '   put "x" into field "y"'),
         "This library is headless",
     ),
+    (
+        # The realistic version of this mistake: somebody makes an existing
+        # wait "keep the UI responsive" and silently makes the reconnect path
+        # re-entrant.
+        "a re-entrant yield outside __writeSocket",
+        lambda s: mutate(s, "         wait 100 milliseconds",
+                         "         wait 100 milliseconds with messages"),
+        "can re-enter the library",
+    ),
 ]
 
 

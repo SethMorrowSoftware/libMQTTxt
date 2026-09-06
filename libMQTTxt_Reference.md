@@ -1,14 +1,19 @@
 # MQTT Client Library Reference
 
-Version 2.12.5 - OXT MQTT 3.1.1 Implementation
+Version 2.12.6 - OXT MQTT 3.1.1 Implementation
 
-> **Status: six engine runs recorded 2026-09-05/06.** Compiles and loads on OXT;
-> connects to mosquitto and hivemq, in the clear and over verified TLS; QoS
-> 0/1/2, UTF-8 and binary payloads, retained, unsubscribe, keep-alive, payloads
-> to 1 MB and the auto-reconnect back-off are observed working. Not yet observed:
-> a reconnect that succeeds, two connections at once, the persistent store, and
-> certificate verification refusing a bad certificate. The record is
-> `docs/ENGINE-NOTES.md`.
+> **Status: seven engine runs recorded 2026-09-05/06.** Compiles and loads on
+> OXT; connects to mosquitto and hivemq, in the clear and over verified TLS; QoS
+> 0/1/2, UTF-8 and binary payloads, retained, unsubscribe, keep-alive and the
+> auto-reconnect back-off are observed working, and payloads to 1 MB round-trip
+> over the internet path.
+>
+> **One open defect:** a large publish to a topic the client is itself
+> subscribed to can stall on a low-latency (LAN) path. 2.12.6 yields to the
+> event loop between chunks to break the stall; that fix has not yet run on an
+> engine. See `docs/ENGINE-NOTES.md` 1.1. Not yet observed either: a reconnect
+> that succeeds, two connections at once, the persistent store, and certificate
+> verification refusing a bad certificate.
 
 ## Table of Contents
 
@@ -271,18 +276,30 @@ mqttSetWriteChunkSize pBytes
 **Parameters:**
 - `pBytes` - Integer (minimum 512; default 16384)
 
-**Why it exists:** the engine's synchronous socket write makes one `send()`.
-What fits in the kernel's TCP send buffer is accepted immediately; what does
-not fit is silently dropped when the write times out, leaving the broker holding
-a partial packet. That buffer is autotuned, so no single write size is safe on
-a cold connection. Every packet is written in chunks of at most this size, and
-a failed write reports how far it got (`timeout after 131072 of 204800 bytes`).
-See `docs/ENGINE-NOTES.md` 1.1. Lower it if large publishes time out; raising
-it towards the packet size reproduces the single-write behaviour it replaced.
+**Why it exists:** a large synchronous write can stall - observed against a
+mosquitto broker on a LAN, where a publish of 128 KB blocked for the whole
+`socketTimeoutInterval` and left the broker holding a partial packet. Every
+packet is written in chunks of at most this size, **the library yields to the
+event loop between chunks** (since 2.12.6, which is the part that addresses the
+stall), and a failed write reports how far it got (`timeout after 98304 of
+131116 bytes`). See `docs/ENGINE-NOTES.md` 1.1 for the seven runs behind this.
+
+**What the chunk size controls, in practice:** a packet at or below this size is
+written in one call with no yield, exactly as the library behaved before 2.12.6.
+A packet above it is written in pieces with a yield between each. So raising
+this above your largest payload restores single-write behaviour for everything,
+and lowering it yields more often.
+
+**The yield is why publishing is re-entrant during a large write.** Your message
+callback can run in the middle of one. Publishing from inside that callback
+while a large write is in flight returns
+`ERROR: a large write is already in progress on this connection` rather than
+corrupting the stream - queue the work and publish after the callback returns.
+Control packets and small publishes are never affected.
 
 **Example:**
 ```OXT
-mqttSetWriteChunkSize 8192  -- for a constrained or high-latency path
+mqttSetWriteChunkSize 8192  -- yield more often on a constrained path
 ```
 
 ---
@@ -865,7 +882,7 @@ function mqttTestLibrary()
 **Example:**
 ```OXT
 put mqttTestLibrary()
--- Returns: "MQTT Library v2.12.5 loaded successfully"
+-- Returns: "MQTT Library v2.12.6 loaded successfully"
 ```
 
 ---

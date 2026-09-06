@@ -387,6 +387,42 @@ def check_no_control_references(lines, problems):
                 "delayed write no gate is watching." % (n, m.group(0).strip()))
 
 
+def check_reentrant_waits(lines, problems):
+    """`wait ... with messages` yields the engine, and only one place may.
+
+    A yield lets application code run in the middle of a library handler. That
+    is what makes the chunked write work - the pending socket read gets its
+    turn, our receive buffer drains, and the broker resumes draining us - and it
+    is also how a second packet can be written into the middle of the first.
+    __writeSocket takes a per-socket lock across its yields and refuses a
+    re-entrant write; nothing else in this library is written to survive being
+    re-entered.
+
+    So the rule is not "no yields", it is "the yields are in the one handler
+    whose invariants account for them". Exempted by NAME, so the exemption
+    cannot quietly widen to a handler that has not thought about it.
+    """
+    current = None
+    for n, raw in enumerate(lines, 1):
+        stripped = strip_noise(raw)
+        m = HANDLER_RE.match(stripped)
+        if m:
+            current = m.group(3)
+            continue
+        if handler_end(stripped):
+            current = None
+            continue
+        if not re.search(r"\bwait\b.*\bwith\s+messages\b", stripped):
+            continue
+        if current == "__writeSocket":
+            continue
+        problems.append(
+            "%d: `wait ... with messages` in `%s`. A yield runs application "
+            "code inside this handler, which can re-enter the library; only "
+            "__writeSocket is written to survive that (it holds a per-socket "
+            "lock across its yields)." % (n, current or "<script level>"))
+
+
 def check_per_byte_reads(lines, problems):
     """`read ... for 1 ...` costs one engine message dispatch per byte.
 
@@ -423,6 +459,7 @@ def main():
     check_per_byte_reads(lines, problems)
     check_no_control_references(lines, problems)
     check_socket_writes_are_checked(lines, problems)
+    check_reentrant_waits(lines, problems)
 
     if problems:
         for p in problems:

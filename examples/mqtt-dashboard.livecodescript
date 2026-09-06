@@ -91,6 +91,7 @@ global gMQTTKeepAliveThreshold    -- When to send PINGREQ (0-1, default 0.75 = 7
 global gMQTTTimerTokens           -- Maps a numeric timer token to its connection ID
 global gMQTTTimerSeq              -- Monotonic counter that mints timer tokens
 global gMQTTWriteChunkSize        -- Largest single write handed to the kernel (bytes)
+global gMQTTWriteLocks            -- socket ID -> true while a multi-chunk write is in progress
 global gMQTTInitialized           -- true once mqttInitialize has run in this engine session
 
 -- ========================================
@@ -155,6 +156,13 @@ command mqttInitialize
    if gMQTTWriteChunkSize is empty then
       put 16384 into gMQTTWriteChunkSize
    end if
+
+   -- Re-entrancy locks for the chunked write. A multi-chunk write yields to the
+   -- engine between chunks (see __writeSocket), and application code that runs
+   -- during that yield may call straight back in; a second packet interleaved
+   -- into the middle of the first is exactly the stream corruption the whole
+   -- write path exists to prevent. Cleared here, never carried across a session.
+   put empty into gMQTTWriteLocks
 
    put true into gMQTTInitialized
 end mqttInitialize
@@ -925,7 +933,7 @@ command mqttCleanupAll
 end mqttCleanupAll
 
 function mqttTestLibrary
-   return "MQTT Library v2.12.5 loaded successfully"
+   return "MQTT Library v2.12.6 loaded successfully"
 end mqttTestLibrary
 
 function mqttSelfTest
@@ -1058,7 +1066,7 @@ function mqttSelfTest
    -- Summary
    put "MQTT Library Self-Test" & return into tResults
    put "=====================" & return after tResults
-   put "Version: 2.12.5" & return after tResults
+   put "Version: 2.12.6" & return after tResults
    put "Passed:" && tPassed & return after tResults
    put "Failed:" && tFailed & return after tResults
 
@@ -1503,38 +1511,67 @@ end __cleanupConnection
 -- while the client sees clean writes and a socket the engine still calls open.
 -- The connection is dead in one direction and nothing on either side says so.
 private function __writeSocket pSocketID, pPacket
-   -- CHUNKED, and the chunk size is the whole fix.
+   -- CHUNKED, AND IT YIELDS BETWEEN CHUNKS. The yield is the part that took
+   -- seven engine runs to find; the chunking on its own does not fix anything.
    --
-   -- FOUR ENGINE RUNS (2026-09-05, docs/ENGINE-NOTES.md 1.1) showed a
-   -- synchronous write completing in a flat 12-16 ms at every size up to
-   -- 128 KB and then blocking for the ENTIRE socketTimeoutInterval at 200 KB,
-   -- with the ceiling moving between runs on the same broker. The reading
-   -- that fits all of it: the engine's synchronous write makes ONE
-   -- non-blocking send(); what fits in the kernel's TCP send buffer is
-   -- accepted in memcpy time, and what does not fit is never re-sent - the
-   -- wait loop runs to its deadline, sets `the result` to "timeout", and
-   -- discards the unsent tail with the socket still open. The ceiling moves
-   -- because the buffer is autotuned from connection history, so NO single
-   -- write size is safe on a cold connection.
+   -- WHAT THE RUNS SHOWED (docs/ENGINE-NOTES.md 1.1). A synchronous write of a
+   -- large PUBLISH completes in a flat 12-16 ms up to some size and then blocks
+   -- for the ENTIRE socketTimeoutInterval, with the failing size moving between
+   -- runs on the same broker. v2.12.3 read that as "the engine makes ONE
+   -- non-blocking send() and never re-sends the tail", and chunked every write
+   -- to 16 KB so each write would fit the kernel's send buffer.
    --
-   -- So no write here is ever larger than a chunk the kernel can take whole.
-   -- Between chunks the kernel is draining the earlier ones to the wire on its
-   -- own (that is TCP, not the engine), so each chunk meets a buffer with room.
-   -- This is also the experiment that tells the two remaining hypotheses
-   -- apart: if the peer had genuinely stopped reading, a chunk would still
-   -- block. Classed INFERRED until a run with chunking round-trips a payload
-   -- larger than the old ceiling.
+   -- THE SEVENTH RUN REFUTED IT. On mosquitto over a LAN, with 16 KB chunks:
+   -- six chunks went out (98304 of 131116 bytes), then one chunk blocked for
+   -- the full ten seconds. A second run got eleven chunks out (180224 of
+   -- 204844) before the same wall. A 16 KB write that succeeds six times and
+   -- then stalls is not a write that was too big for the buffer: the socket
+   -- became unwritable and STAYED unwritable, which means the peer stopped
+   -- reading.
+   --
+   -- WHY THE PEER STOPS READING, and this is the reading the yield is built on:
+   -- the client is subscribed to the topic tree it is publishing to, so the
+   -- broker is pushing the echo back while we are still writing. A synchronous
+   -- write does not return to the engine's event loop, so nothing services the
+   -- armed `read from socket`; our receive buffer fills, the broker's writes to
+   -- us block, and a broker that cannot flush to us stops draining what we
+   -- send. Both directions stall on each other. The hivemq runs do not
+   -- contradict this - there the whole payload fitted the send buffer that a
+   -- long round-trip path autotunes large, so the write never blocked and the
+   -- event loop got back to reading. INFERRED: the discriminating experiment is
+   -- a large publish to a topic NOTHING echoes back, which the conformance run
+   -- now performs before the ladder.
+   --
+   -- SO: between chunks, hand the engine one turn of its event loop. That lets
+   -- the pending read deliver, which drains our receive buffer, which unblocks
+   -- the broker, which resumes draining us. It also stops a megabyte publish
+   -- from freezing the UI and starving the keep-alive timers, which is worth
+   -- having whatever the mechanism turns out to be.
+   --
+   -- THE YIELD IS RE-ENTRANT AND THAT IS THE HAZARD. Application code can run
+   -- during it - a message callback that publishes, or disconnects. A second
+   -- packet written into the middle of this one is precisely the corruption
+   -- this function exists to prevent, so a multi-chunk write takes a lock and a
+   -- re-entrant write is REFUSED rather than interleaved. Small packets (every
+   -- control packet, and any publish that fits one chunk) never yield, never
+   -- take the lock, and are byte-for-byte the code that ran before.
+   --
+   -- The lock lives in its own global, NOT in the connection record: the
+   -- re-entrant code may call mqttCleanupAll, and writing a key back into a
+   -- deleted record would recreate it as a zombie the keep-alive sweep walks
+   -- forever.
    --
    -- Synchronous on purpose. `write ... with message` would not block the
    -- engine, but the engine discards a queued write on `close socket`, and
    -- both disconnect paths write DISCONNECT then close on the next line - an
    -- async DISCONNECT would be dropped and every clean disconnect would fire
-   -- the Last Will. Chunking keeps the guarantee those paths rely on.
+   -- the Last Will. DISCONNECT is two bytes, so it never yields and never
+   -- takes the lock; the guarantee those paths rely on is unchanged.
    --
    -- Returns empty on success, or the error text WITH how much had gone out,
    -- because "timeout after 131072 of 204800 bytes" is a measurement and
    -- "timeout" is a symptom.
-   local tError, tRes, tTotal, tPos, tEnd, tChunkSize
+   local tError, tRes, tTotal, tPos, tEnd, tChunkSize, tYields
    put the number of bytes of pPacket into tTotal
    if tTotal is 0 then
       return empty
@@ -1545,21 +1582,66 @@ private function __writeSocket pSocketID, pPacket
       put 16384 into tChunkSize
    end if
 
+   -- One chunk: the old path exactly, with no yield and no lock. Raising
+   -- gMQTTWriteChunkSize above your largest payload restores the pre-2.12.6
+   -- behaviour for every write.
+   if tTotal <= tChunkSize then
+      try
+         write pPacket to socket pSocketID
+      catch tError
+         return tError && "after 0 of" && tTotal && "bytes"
+      end try
+      put the result into tRes
+      if tRes is not empty then
+         return tRes && "after 0 of" && tTotal && "bytes"
+      end if
+      return empty
+   end if
+
+   if gMQTTWriteLocks[pSocketID] is true then
+      return "a large write is already in progress on this connection" && \
+            "(refused rather than interleaved into it)"
+   end if
+   put true into gMQTTWriteLocks[pSocketID]
+
+   put 0 into tYields
    put 1 into tPos
    repeat while tPos <= tTotal
       put min(tPos + tChunkSize - 1, tTotal) into tEnd
       try
          write (byte tPos to tEnd of pPacket) to socket pSocketID
       catch tError
+         delete variable gMQTTWriteLocks[pSocketID]
          return tError && "after" && (tPos - 1) && "of" && tTotal && "bytes"
       end try
 
       put the result into tRes
       if tRes is not empty then
+         delete variable gMQTTWriteLocks[pSocketID]
          return tRes && "after" && (tPos - 1) && "of" && tTotal && "bytes"
       end if
       put tEnd + 1 into tPos
+
+      if tPos <= tTotal then
+         -- ONE turn of the event loop. Zero milliseconds: this is a yield, not
+         -- a delay - it costs the pending messages their run and nothing else.
+         wait 0 milliseconds with messages
+         add 1 to tYields
+
+         -- The yield ran application code. It may have disconnected us, and
+         -- writing the rest of a packet into a socket that has gone is how a
+         -- reconnected connection inherits a corrupt stream.
+         if not __isSocketOpen(pSocketID) then
+            delete variable gMQTTWriteLocks[pSocketID]
+            return "the socket closed mid-write, after" && (tPos - 1) && \
+                  "of" && tTotal && "bytes"
+         end if
+      end if
    end repeat
+
+   delete variable gMQTTWriteLocks[pSocketID]
+   __mqttDebug "Wrote" && tTotal && "bytes in" && (tYields + 1) && \
+         "chunks with" && tYields && "yields"
    return empty
 end __writeSocket
 

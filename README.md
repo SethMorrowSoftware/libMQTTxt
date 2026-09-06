@@ -426,12 +426,22 @@ refused every attempt, and a manual disconnect stopped it cleanly. It also
 found the reconnect log line reporting a clamped attempt number, fixed in
 2.12.5.
 
-**Still unproven:** the 1 MB rung on the mosquitto LAN path in the clear, which
-is the run that would confirm the send-buffer mechanism (the hivemq path had
-carried 200 KB before chunking existed); a reconnect that *succeeds* and
-resubscribes; multi-connection; the persistent store; and certificate
-verification rejecting a bad certificate. The performance figures below are
-from 2.11.x and have not been re-measured.
+The seventh run took that ladder back to the mosquitto LAN path in the clear —
+and **refuted the diagnosis.** Chunking worked exactly as designed and the write
+stalled anyway: six 16 KB chunks out, the seventh blocked for the full ten
+seconds, then the same shape one rung higher on a second run. A chunk that
+succeeds six times and stalls on the seventh was never too big. The peer had
+stopped reading, and the reading that now fits is that we stopped reading first:
+a synchronous write never returns to the event loop, so the echo of our own
+publish backs up and the broker cannot flush to us. 2.12.6 yields between
+chunks. Everything before the ladder passed on that path, twice.
+
+**Still unproven:** whether the yield fixes it, and whether the echo is really
+the cause — the next run answers both, because the conformance button now
+publishes 1 MB to a topic nothing echoes back before it runs the ladder. Also
+unproven: a reconnect that *succeeds* and resubscribes; multi-connection; the
+persistent store; and certificate verification rejecting a bad certificate. The
+performance figures below are from 2.11.x and have not been re-measured.
 
 ## Performance
 
@@ -502,7 +512,35 @@ MQTT 3.1.1 Specification Implementation:
 
 ## Version History
 
-### 2.12.5 (Current)
+### 2.12.6 (Current)
+
+From the seventh engine run, which **refuted the 2.12.3 diagnosis**. See
+`docs/ENGINE-NOTES.md` 1.1.
+
+- **A large write now yields to the event loop between chunks.** Chunking on its
+  own did not fix the mosquitto path: with 16 KB chunks, six went out and the
+  seventh blocked for the full socket timeout. A chunk that succeeds six times
+  and then stalls was never too big for the send buffer — the peer stopped
+  reading. The reading that fits: *we* stopped reading first. A synchronous
+  write never returns to the event loop, so the echo of our own publish backs
+  up in our receive buffer, the broker cannot flush to us, and it stops draining
+  what we send. One `wait 0 milliseconds with messages` per chunk gives the
+  pending read its turn and breaks the stall. It also stops a megabyte publish
+  from freezing the UI and starving the keep-alive timers.
+- **The yield is re-entrant, so multi-chunk writes take a lock.** Application
+  code can run during a yield; a callback that publishes would write a second
+  packet into the middle of the first. A re-entrant write is refused with an
+  error rather than interleaved, and the socket is re-checked after every yield.
+  Single-chunk writes — every control packet, `DISCONNECT` included — never
+  yield and never lock, so the clean-disconnect guarantee is unchanged.
+- **A new gate:** `wait ... with messages` is refused anywhere in the library
+  except the one handler written to survive being re-entered.
+- **The conformance run gets the experiment that settles it:** 1 MB published to
+  a topic nothing is subscribed to, before the ladder, judged by its PUBACK. No
+  echo, no inbound pressure. If that passes where the ladder fails, the echo is
+  the cause; if it fails too, the write path is.
+
+### 2.12.5
 
 From the sixth engine run: the first over TLS, the first with auto-reconnect
 ticked, and the first green conformance run at every rung of the ladder.

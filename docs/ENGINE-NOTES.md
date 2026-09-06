@@ -149,6 +149,12 @@ reads were blocked by a harness fault, so it could not cite a line. It is the
 reading that fits every observation, and the fix below is also the experiment
 that tests it.
 
+> **REFUTED by the seventh run, 2026-09-06. Everything from here to the sixth
+> run below is kept as the record of a wrong turn, not as guidance.** The
+> chunked write did not fix the mosquitto path, and the reason it did not is
+> that this mechanism is not what is happening. Read on to "What the seventh
+> run showed" for the current reading.
+
 **The decision (v2.12.3): chunked synchronous writes.** `__writeSocket` now
 hands the kernel no more than `gMQTTWriteChunkSize` bytes per `write` (default
 16 KB, the smallest cold buffer either platform starts with), checking `the
@@ -206,6 +212,82 @@ One more observation for whoever reads the next run: the write call took
 either about 12 ms or about 115 ms, with no relation to size (64 KB slow,
 200 KB fast). Two clusters, seven points, no explanation offered here - it is
 recorded so the mosquitto run can be compared against it.
+
+### What the seventh run showed, and what it refutes
+**OBSERVED 2026-09-06**, mosquitto at 192.168.1.104:1883 in the clear, v2.12.4
+with 16 KB chunking, `socketTimeoutInterval` 10000. Two conformance runs back
+to back on one engine:
+
+    run   rungs that passed          then
+    a     4096, 16384, 65536         131072: timeout after 98304 of 131116 bytes
+    b     4096, 16384, 65536, 131072 204800: timeout after 180224 of 204844 bytes
+
+98304 is six 16 KB chunks. 180224 is eleven. **So the chunking worked exactly as
+designed and the write stalled anyway** - six 16 KB writes were accepted in
+about 13 ms, and the seventh blocked for the full ten seconds with zero bytes
+of progress.
+
+**That refutes the v2.12.3 mechanism.** "One non-blocking `send()` whose
+unsent tail is discarded" predicts that a write small enough to fit always
+succeeds. Six succeeded and the seventh did not, on the same socket, at the
+same size, milliseconds apart. Nothing about the chunk was too big. The socket
+became unwritable and stayed unwritable for ten seconds on a LAN, which means
+the peer's receive window was shut: **the broker stopped reading us.**
+
+**The current reading (INFERRED): we stopped reading first, and it is a
+two-sided stall.** The conformance run subscribes to the tree it publishes to,
+so from the first bytes of a large PUBLISH the broker is pushing the echo back
+at us. A synchronous `write` never returns to the engine's event loop, so the
+armed `read from socket` is never serviced, our receive buffer fills, the
+broker's writes to us block, and a broker that cannot flush to a client stops
+draining what that client sends. Both directions are then waiting on the other.
+Chunking cannot help: it changes the size of each write, not the fact that
+nothing is reading.
+
+Why this fits the runs that passed, which is where the earlier reading went
+wrong. Over the internet to hivemq the send buffer autotunes large (a long
+round-trip path needs a big window), so the whole payload was accepted in one
+go, the write returned, and the event loop got back to reading before anything
+backed up. On a LAN the round trip is sub-millisecond, so the buffer stays
+small AND the echo starts arriving almost immediately - the worst case for this
+stall, and the only path where it has ever been seen. The ceiling moves between
+runs because the buffer size does.
+
+**Why it stays INFERRED.** Nothing here observed the broker's side. The
+discriminating experiment is now the conformance run's first large stage
+(`ctStageNoEcho`, ahead of the ladder): the same 1 MB payload published to a
+topic *nothing is subscribed to*, judged by its PUBACK. No echo, no inbound
+pressure. If that passes on the path where the ladder fails, the echo is the
+cause. If it fails too, the echo is exonerated and the engine's write path is
+the suspect again.
+
+**The decision (v2.12.6): the chunked write yields between chunks.**
+`__writeSocket` now runs `wait 0 milliseconds with messages` between chunks, so
+the engine gets one turn of its event loop per 16 KB: the pending read
+delivers, the receive buffer drains, the broker unblocks and resumes draining
+us. The chunking stays - it is what bounds each blocking window and what makes
+the error text a measurement - but the yield is the part that addresses the
+stall. It also stops a megabyte publish from freezing the UI and starving the
+keep-alive timers, which is worth having whichever way the experiment falls.
+
+**The hazard the yield introduces, and the guard.** A yield runs application
+code inside the write. A message callback that publishes would write a second
+packet into the middle of this one - the exact stream corruption this whole
+path exists to prevent. So a multi-chunk write takes a per-socket lock
+(`gMQTTWriteLocks`, its own global, never the connection record, which
+re-entrant code may delete) and a re-entrant write is REFUSED with an error
+rather than interleaved; after each yield the socket is re-checked and a write
+whose socket went away reports how far it got. Single-chunk writes - every
+control packet, DISCONNECT included, and any publish that fits one chunk -
+never yield, never lock, and are byte-for-byte the code that ran before.
+`tools/check-libmqttxt.py` refuses `wait ... with messages` anywhere else in
+the library.
+
+**If the yield is not enough** (the ladder still stalls while the un-echoed
+publish passes), the next candidate is asynchronous writes for large payloads
+only, keeping DISCONNECT synchronous - which is the design the Last Will
+objection below ruled out for ALL writes, and which that objection does not
+actually reach when it is confined to publishes.
 
 ### 1.4 A DISCONNECT written just before `close socket` may not reach the broker
 **INFERRED (2026-09-06), not yet observed, recorded so it is not lost.**
@@ -401,6 +483,27 @@ more facts:
   run either shows that line (and the route question sharpens) or does not
   (and preOpenStack worked).
 
+**Seventh run, 2026-09-06, back on stack "Untitled 1" (v2.12.4).** The split
+assertion paid for itself:
+
+    FAIL  preOpenStack fired before openStack (marker: empty)
+    PASS  the library is initialised: keep-alive threshold set (0.75)
+
+**preOpenStack did not fire on this stack either** - the second stack, in the
+second engine session, to reach `openStack` with its `preOpenStack` marker
+unset. Whatever the operator's edit-and-run sequence is, it is not delivering
+`preOpenStack`, and that is now the expected shape rather than a surprise. The
+library was initialised anyway. On this stack that proves nothing new about the
+backstop (this is the engine session where `start using` had already run
+`libraryStack`), which is why 2.12.5 logs the self-initialisation: the log line
+is what will tell the two paths apart on a fresh engine.
+
+**The lesson for the demo, not the library:** a one-file demo cannot rely on
+`preOpenStack` for anything it needs in order to work. It initialises from
+`mdStart` as well, and the library initialises itself; `preOpenStack` is now
+belt, braces and a third fastener. The demo header says REOPEN in capitals for
+the same reason.
+
 ### 2.2 The engine's `socketClosed` reaches the library
 **OBSERVED 2026-09-06.** Connecting in the clear to broker.hivemq.com:8883 - the
 TLS port - produced `Socket connected`, `CONNECT packet sent`, then
@@ -529,3 +632,36 @@ off); two connections at once (`kCtHost2`); the persistent store; the Will/RST
 question in 1.4; certificate verification rejecting a bad certificate (1.2);
 the split boot check on a fresh engine, and the route by which "Untitled 2"
 reached openStack (2.1); and the self-initialisation log line added in 2.12.5.
+
+### Seventh run, 2026-09-06, OXT + mosquitto 192.168.1.104:1883, v2.12.4
+
+Two conformance runs back to back, 9 passed and 2 failed each, both aborting at
+the large-payload ladder - **and this is the run that refuted the chunked-write
+mechanism** (1.1). Chunking behaved exactly as designed and the stall happened
+anyway: six 16 KB chunks out and the seventh blocked for ten seconds in the
+first run, eleven chunks and the twelfth in the second.
+
+**What it establishes:**
+
+- **The v2.12.3 diagnosis was wrong** (1.1). A 16 KB write that succeeds six
+  times and then stalls for ten seconds is not a write that was too large for
+  the send buffer. The current reading is a two-sided stall, INFERRED, with the
+  experiment now in the run.
+- **Everything before the ladder passes on this path**, twice, deterministically:
+  SUBSCRIBE, QoS 0/1/2 with their ack legs, exactly-once, UTF-8, all 256 byte
+  values. The mosquitto path is not fragile; one specific thing on it is broken.
+- **The failing size still moves** - 131072 in the first run, 204800 in the
+  second, same broker, same engine, minutes apart. Consistent with a send buffer
+  that autotunes, and inconsistent with any fixed broker limit; `message_size_limit`
+  is now effectively ruled out as well as formally unchecked.
+- **`__failWrite` and the abort path are solid**, run twice more: the error
+  carries the byte count, the connection is reset rather than left corrupt, and
+  the run stops with `ABORT` instead of printing unearned PASSes below it.
+
+**Newly OBSERVED in the boot check:** preOpenStack did not fire on "Untitled 1"
+either (2.1). Two stacks, two sessions, same shape.
+
+**What v2.12.6 does about it:** the write yields to the event loop between
+chunks, under a re-entrancy lock, and the conformance run gets a stage that
+publishes 1 MB to a topic nothing echoes back - the experiment that tells the
+echo stall apart from a broken write path. Both are in the next run.
