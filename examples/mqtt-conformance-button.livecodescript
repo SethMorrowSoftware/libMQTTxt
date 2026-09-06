@@ -23,8 +23,10 @@
 -- Every render carries "RUN NOT FINISHED" until the last stage closes it.
 --
 -- NOTHING HERE IS DESTRUCTIVE TO YOUR BROKER. Every topic lives under
--- libmqttxt/ct/<milliseconds>/, unique per run, and the one retained message it
--- sets is cleared before the run ends.
+-- libmqttxt/ct/<milliseconds>/ or libmqttxt/ctquiet/<milliseconds>/, unique per
+-- run, and the one retained message it sets is cleared before the run ends.
+-- The ctquiet tree is deliberately OUTSIDE the run's own subscription; see
+-- ctStageNoEcho for what that is for.
 
 -- The second broker for the multi-connection stage. The library keys a
 -- connection by "host:port", so TWO connections to one broker are impossible by
@@ -52,7 +54,7 @@ local sCtRunning
 local sCtStage, sCtTicks, sCtEntered
 local sCtPass, sCtFail, sCtSkip
 local sCtLog
-local sCtBase, sCtHost, sCtPort
+local sCtBase, sCtQuiet, sCtHost, sCtPort
 local sCtSeen            -- topic -> payload, filled by ctOnMessage
 local sCtCount           -- topic -> how many times it arrived (QoS 2 dedup)
 local sCtUtf8, sCtBin, sCtBig
@@ -100,7 +102,13 @@ command ctBegin
 
    -- Unique per run, so a retained message left by an earlier run cannot be
    -- mistaken for this one's.
-   put "libmqttxt/ct/" & the milliseconds into sCtBase
+   local tStamp
+   put the milliseconds into tStamp
+   put "libmqttxt/ct/" & tStamp into sCtBase
+
+   -- A SECOND TREE, deliberately outside the "<base>/#" this run subscribes to,
+   -- so a publish there comes back to nobody. ctStageNoEcho is the reason.
+   put "libmqttxt/ctquiet/" & tStamp into sCtQuiet
 
    -- The payloads whose ROUND TRIP is the actual proof. Built once here so a
    -- stage compares against the same bytes it published.
@@ -161,7 +169,7 @@ command ctTick
 
    -- A dropped link mid-run invalidates everything after it, so say so and stop
    -- rather than reporting a cascade of timeouts that all have one cause.
-   if sCtStage < 11 and not mqttIsConnected(sCtHost, sCtPort) then
+   if sCtStage < 12 and not mqttIsConnected(sCtHost, sCtPort) then
       ctSay "ABORT  the connection dropped mid-run; nothing below was tested"
       add 1 to sCtFail
       ctFinish
@@ -190,18 +198,21 @@ command ctTick
          ctStageBinary
          break
       case 7
-         ctStageBig
+         ctStageNoEcho
          break
       case 8
-         ctStageRetained
+         ctStageBig
          break
       case 9
-         ctStageUnsubscribe
+         ctStageRetained
          break
       case 10
-         ctStageSecondConnection
+         ctStageUnsubscribe
          break
       case 11
+         ctStageSecondConnection
+         break
+      case 12
          ctStageHold
          break
       default
@@ -391,6 +402,87 @@ command ctStageBinary
    ctDeadline "binary payload: nothing came back", kCtDeadline
 end ctStageBinary
 
+-- THE DISCRIMINATING EXPERIMENT, and it runs BEFORE the ladder because the
+-- ladder can take the connection down with it.
+--
+-- Seven engine runs (docs/ENGINE-NOTES.md 1.1) have shown a large PUBLISH
+-- stalling on the mosquitto LAN path: with 16 KB chunking, six chunks went out
+-- and the seventh blocked for the whole socketTimeoutInterval. A 16 KB write
+-- that works six times and then stops is not a write that was too big; the
+-- socket became unwritable and stayed unwritable, which means the peer stopped
+-- reading.
+--
+-- The candidate explanation is that WE stopped reading first. Every other big
+-- publish in this run goes to a topic this run is subscribed to, so the broker
+-- is pushing the echo back at us while we are inside a synchronous write that
+-- never returns to the event loop to read it. Our receive buffer fills, the
+-- broker's writes to us block, and a broker that cannot flush to us stops
+-- draining what we send.
+--
+-- So: the same size, to a topic NOBODY is subscribed to. Nothing to echo.
+--   this passes, the ladder fails -> the echo is the cause
+--   this passes, the ladder passes -> the cause was the echo and the yield in
+--                                     __writeSocket 2.12.6 fixes it
+--   this fails                     -> the echo is exonerated; the write path
+--                                     itself is the suspect and async is next
+--
+-- THE PUBACK IS THE PROOF. Nothing comes back on this topic, so a round trip
+-- cannot be the criterion. A QoS 1 PUBACK is the broker saying it parsed a
+-- complete PUBLISH of that length - the same evidence, one step earlier.
+command ctStageNoEcho
+   local tRc, tInfo, tT0, tWriteMs, tSize, tLabel
+   put 1048576 into tSize
+   put tSize & " bytes to a topic nothing echoes back" into tLabel
+
+   if not sCtEntered then
+      put ctPayload(tSize) into sCtBig
+
+      put the milliseconds into tT0
+      put mqttPublish(sCtHost, sCtPort, sCtQuiet & "/big", sCtBig, 1, false) \
+            into tRc
+      put the milliseconds - tT0 into tWriteMs
+      put tWriteMs into sCtWriteMs
+
+      if tRc is not "OK" then
+         ctFail tLabel, tRc & " (the write call took " & tWriteMs & "ms)"
+         ctSay "      NOTE: this publish had NO echo to contend with, so the " \
+               & "stall in engine notes 1.1 is NOT the broker blocking on an " \
+               & "echo we were not reading. The write path itself is the suspect."
+         ctNext
+         exit ctStageNoEcho
+      end if
+      put true into sCtEntered
+      exit ctStageNoEcho
+   end if
+
+   put mqttGetConnectionInfo(sCtHost, sCtPort) into tInfo
+   if tInfo["pendingAcks"] is empty then
+      ctPass tLabel & " was PUBACKed (write call " & sCtWriteMs & "ms, " \
+            & ctRate(tSize, sCtWriteMs) & ")"
+      ctNext
+      exit ctStageNoEcho
+   end if
+   ctDeadline "no PUBACK for the un-echoed " & tSize & "-byte publish", \
+         kCtDeadlineBig
+end ctStageNoEcho
+
+-- One filler payload, built the same way wherever a size is needed. 1 KB of
+-- hex digits repeated: cheap to build, and every byte differs from its
+-- neighbours enough that a truncated or duplicated block shows up in a
+-- byte-for-byte compare.
+function ctPayload pSize
+   local tChunk, tPayload
+   put empty into tChunk
+   repeat 64 times
+      put "0123456789abcdef" after tChunk
+   end repeat
+   put empty into tPayload
+   repeat (pSize div 1024) times
+      put tChunk after tPayload
+   end repeat
+   return tPayload
+end ctPayload
+
 -- THE STREAMING-READ PROOF, AS A LADDER RATHER THAN ONE SHOT.
 --
 -- The first version published 200 KB once and reported TIMEOUT, which says the
@@ -402,16 +494,18 @@ end ctStageBinary
 -- holding a partial packet, and every later result would be a consequence of
 -- this one rather than a measurement of its own.
 command ctStageBig
-   local tTopic, tRc, tGot, tSize, tPayload, tChunk, tI
+   local tTopic, tRc, tGot, tSize
 
    put ctBigSize(sCtBigStep) into tSize
    if tSize is 0 then
-      if sCtBigOk >= 1048576 then
-         ctPass "large payloads round-trip up to " & sCtBigOk & " bytes - past " \
-               & "any kernel send buffer, so the chunked write is doing its job"
-      else
-         ctPass "large payloads round-trip up to " & sCtBigOk & " bytes"
-      end if
+      -- The PASS states what was seen and nothing about why. An earlier version
+      -- added "so the chunked write is doing its job" at 1 MB, and the first
+      -- 1 MB pass then came over TLS to hivemq - a path that had carried 200 KB
+      -- BEFORE chunking existed. Whether the chunking is what made 1 MB possible
+      -- is a question for the mosquitto LAN path where a single write failed,
+      -- and for docs/ENGINE-NOTES.md 1.1, not for a line in a test log.
+      ctPass "large payloads round-trip intact up to " & sCtBigOk & " bytes (" \
+            & "writes chunked at " & mqttGetWriteChunkSize() & " bytes)"
       ctNext
       exit ctStageBig
    end if
@@ -419,15 +513,7 @@ command ctStageBig
    put sCtBase & "/big" & tSize into tTopic
 
    if not sCtEntered then
-      put empty into tChunk
-      repeat 64 times
-         put "0123456789abcdef" after tChunk
-      end repeat
-      put empty into tPayload
-      repeat (tSize div 1024) times
-         put tChunk after tPayload
-      end repeat
-      put tPayload into sCtBig
+      put ctPayload(tSize) into sCtBig
 
       -- TIME THE WRITE. This is the measurement that separates the two
       -- explanations for a size that fails: if the write time grows roughly
@@ -500,10 +586,13 @@ end ctRate
 function ctBigSize pStep
    -- Doubling from 4 KB. 64 KB is the first size past a typical socket
    -- buffer; 128 KB is the first whose Remaining Length needs three varint
-   -- bytes; 204800 is where run 4 failed with a single write. The last two
-   -- rungs are the point of the chunked write: 512 KB and 1 MB are well past
-   -- any kernel send buffer, so they round-trip ONLY if the library never
-   -- hands the kernel more than it can take in one send().
+   -- bytes; 131072 and 204800 are where runs 3 and 4 failed with a single
+   -- write on the mosquitto LAN path. The last two rungs exist for the chunked
+   -- write: 512 KB and 1 MB are past any cold kernel send buffer. On the path
+   -- where the single write failed, a 1 MB round trip is the experiment that
+   -- tests the mechanism in docs/ENGINE-NOTES.md 1.1; on a path that carried
+   -- 200 KB before chunking (hivemq, run 2) it shows the ceiling is higher, and
+   -- no more than that.
    switch pStep
       case 1
          return 4096
@@ -770,10 +859,16 @@ end ctSay
 command ctFinish
    put false into sCtRunning
 
-   -- Put the dashboard back the way it was found.
+   -- Put the dashboard back the way it was found. The unsubscribe is
+   -- conditional because a green run has already unsubscribed in its own
+   -- stage; sending a second UNSUBSCRIBE for a filter the table no longer
+   -- lists is legal MQTT, and it also printed an "Unsubscribe confirmed"
+   -- AFTER the RUN FINISHED line, which read as a stage that had run late.
    mqttSetCallbackTarget the long id of this stack
    mqttSetMessageCallback "mdOnMessage"
-   get mqttUnsubscribe(sCtHost, sCtPort, sCtBase & "/#")
+   if mqttGetSubscriptions(sCtHost, sCtPort) contains (sCtBase & "/#") then
+      get mqttUnsubscribe(sCtHost, sCtPort, sCtBase & "/#")
+   end if
 
    ctSay "      " & sCtPass & " passed, " & sCtFail & " failed, " \
          & sCtSkip & " skipped - RUN FINISHED"

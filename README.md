@@ -397,7 +397,10 @@ That same run found two things the gates could not:
   Fixed in 2.12.1; a gate now refuses a bare `write ... to socket`.
 - **`secure socket ... with verification` reported success on a plaintext
   port.** Treat TLS status as unverified regardless of what the log says, and
-  confirm a TLS connection reached CONNACK before trusting it. Not yet closed.
+  confirm a TLS connection reached CONNACK before trusting it. Not yet closed:
+  the sixth run showed TLS working end to end against a valid certificate on
+  port 8883, which proves the channel and still says nothing about what
+  "verified" would do with a bad one.
 
 A second run the same day, against `broker.hivemq.com` with the write check
 in place, added **keep-alive end to end** (100s idle, PINGRESP received and
@@ -408,11 +411,36 @@ the library was right.
 
 Runs three and four, back on the mosquitto that first failed, confirmed the
 diagnosis and located the cause: a synchronous write that exceeds the kernel's
-send buffer silently drops its tail. 2.12.3 chunks every write; the 1 MB rung of
-the conformance ladder is the test of that fix and has not yet run.
+send buffer silently drops its tail. 2.12.3 chunks every write.
 
-**Still unproven:** the chunked write itself (the 1 MB rung), auto-reconnect
-after a broker restart, multi-connection, persistent store, and TLS. The
+The fifth run, on a fresh engine, found the embedded library uninitialised (the
+earlier runs had inherited populated globals from a standalone-library session)
+and 2.12.4 made the library initialise itself before it touches the network.
+
+The sixth run, 2026-09-06, was the first over **TLS** (verified, against
+`broker.hivemq.com:8883`) and the first with **auto-reconnect** ticked. The
+conformance run was green at every stage, 14 passed and 0 failed, and the
+ladder round-tripped **1 MB** intact. Auto-reconnect's back-off was observed
+(1, 2, 4, 8, 16 s, then 30 s with jitter, unbounded) against a port that
+refused every attempt, and a manual disconnect stopped it cleanly. It also
+found the reconnect log line reporting a clamped attempt number, fixed in
+2.12.5.
+
+The seventh run took that ladder back to the mosquitto LAN path in the clear —
+and **refuted the diagnosis.** Chunking worked exactly as designed and the write
+stalled anyway: six 16 KB chunks out, the seventh blocked for the full ten
+seconds, then the same shape one rung higher on a second run. A chunk that
+succeeds six times and stalls on the seventh was never too big. The peer had
+stopped reading, and the reading that now fits is that we stopped reading first:
+a synchronous write never returns to the event loop, so the echo of our own
+publish backs up and the broker cannot flush to us. 2.12.6 yields between
+chunks. Everything before the ladder passed on that path, twice.
+
+**Still unproven:** whether the yield fixes it, and whether the echo is really
+the cause — the next run answers both, because the conformance button now
+publishes 1 MB to a topic nothing echoes back before it runs the ladder. Also
+unproven: a reconnect that *succeeds* and resubscribes; multi-connection; the
+persistent store; and certificate verification rejecting a bad certificate. The
 performance figures below are from 2.11.x and have not been re-measured.
 
 ## Performance
@@ -484,7 +512,62 @@ MQTT 3.1.1 Specification Implementation:
 
 ## Version History
 
-### 2.12.4 (Current)
+### 2.12.6 (Current)
+
+From the seventh engine run, which **refuted the 2.12.3 diagnosis**. See
+`docs/ENGINE-NOTES.md` 1.1.
+
+- **A large write now yields to the event loop between chunks.** Chunking on its
+  own did not fix the mosquitto path: with 16 KB chunks, six went out and the
+  seventh blocked for the full socket timeout. A chunk that succeeds six times
+  and then stalls was never too big for the send buffer — the peer stopped
+  reading. The reading that fits: *we* stopped reading first. A synchronous
+  write never returns to the event loop, so the echo of our own publish backs
+  up in our receive buffer, the broker cannot flush to us, and it stops draining
+  what we send. One `wait 0 milliseconds with messages` per chunk gives the
+  pending read its turn and breaks the stall. It also stops a megabyte publish
+  from freezing the UI and starving the keep-alive timers.
+- **The yield is re-entrant, so multi-chunk writes take a lock.** Application
+  code can run during a yield; a callback that publishes would write a second
+  packet into the middle of the first. A re-entrant write is refused with an
+  error rather than interleaved, and the socket is re-checked after every yield.
+  Single-chunk writes — every control packet, `DISCONNECT` included — never
+  yield and never lock, so the clean-disconnect guarantee is unchanged.
+- **A new gate:** `wait ... with messages` is refused anywhere in the library
+  except the one handler written to survive being re-entered.
+- **The conformance run gets the experiment that settles it:** 1 MB published to
+  a topic nothing is subscribed to, before the ladder, judged by its PUBACK. No
+  echo, no inbound pressure. If that passes where the ladder fails, the echo is
+  the cause; if it fails too, the write path is.
+
+### 2.12.5
+
+From the sixth engine run: the first over TLS, the first with auto-reconnect
+ticked, and the first green conformance run at every rung of the ladder.
+
+- **The reconnect log reports the real attempt number.** The back-off clamps the
+  exponent at 16 so `2 ^ n` cannot overflow across a long outage; the log line
+  reused the clamped variable and read `attempt 17` for forty attempts running.
+  The count and the exponent are now separate, and the callback, which always
+  read the counter directly, is unchanged.
+- **Self-initialisation is logged.** When `mqttConnect` finds the library
+  uninitialised it now says so (`Library initialised on first use ...`), so an
+  embedder whose `preOpenStack` did not take effect sees it in the log instead
+  of deducing it from a missing line. The sixth run could only infer that this
+  path had carried its connection; the next one can observe it.
+- The conformance ladder's 1 MB PASS line states what it saw and no longer
+  claims why; the first 1 MB pass came over TLS to a broker that had carried
+  200 KB before chunking existed, which proves the size and not the mechanism.
+  The run's cleanup also no longer unsubscribes a filter it has already dropped.
+- The demo header tells the truth about six engine runs, and says REOPEN: applying
+  a script to an open stack sends neither `preOpenStack` nor `openStack`, which
+  the sixth run demonstrated by getting no boot block at all.
+- `docs/ENGINE-NOTES.md`: 1.1 (1 MB observed, mechanism still inferred), 1.2
+  (TLS end to end observed; "verified" still unproven), new 1.5 (auto-reconnect
+  observed, unbounded by design), 2.1 (the backstop inferred to have carried
+  the connection), and the sixth run record.
+
+### 2.12.4
 
 From the fifth engine run, the first on a fresh engine session, and the first
 time the boot self-check failed for a real reason.
