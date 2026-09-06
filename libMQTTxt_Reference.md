@@ -15,9 +15,10 @@ Version 2.13.0 - OXT MQTT 3.1.1 Implementation
 > link's own rate. `mqttPublish` returning "OK" therefore means QUEUED; the
 > acknowledgment is what proves delivery. `mqttSetAsyncWrites false` falls back
 > to the paced synchronous path of 2.12.8. **Observed working 2026-09-06** on
-> Windows 11: 15 passed, 0 failed, a megabyte round trip in under 765 ms.
+> Windows 11, in the clear and over verified TLS: 16 passed, 0 failed, a
+> megabyte round trip in 522 ms with the write call at 10-13 ms.
 > `docs/ENGINE-NOTES.md` section 4 has the design and the ordering risk it
-> carries.
+> carries. The synchronous fallback has not itself been run on an engine yet.
 >
 > **Platforms observed:** Kubuntu and Windows 11, with no behavioural difference
 > between them.

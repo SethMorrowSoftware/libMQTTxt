@@ -564,14 +564,19 @@ MQTT 3.1.1 Specification Implementation:
   mid-flight, a socket closing mid-packet. That last-but-one case caught a real
   defect in the first draft before it ever ran.
 
-**Run on an engine 2026-09-06: 15 passed, 0 failed**, on Windows 11 against
-`broker.hivemq.com` — the queue's first outing and the project's first run on
-anything but Linux. Nineteen packets interleaved with PINGREQs and subscription
-changes across a ladder to 1 MB, every one acknowledged in sequence. A megabyte
-round trip took under 765 ms against the 3150 ms of pure pausing that 2.12.8
-imposed arithmetically. The run also caught the conformance button reporting its
-own poll interval as throughput; arrival times are now stamped in the message
-callback and the stages that cannot measure say so instead of printing a rate.
+**Run on an engine 2026-09-06**, on Windows 11 against `broker.hivemq.com` —
+the queue's first outing and the project's first runs on anything but Linux.
+In the clear: 15 passed, 0 failed. Over verified TLS: **16 passed, 0 failed**,
+with the boot self-check green at 14 of 14. Nineteen packets interleaved with
+PINGREQs and subscription changes across a ladder to 1 MB, every one
+acknowledged in sequence.
+
+**A megabyte round-trips in 522 ms**, against the 3150 ms of pure pausing that
+2.12.8 imposed arithmetically, and the write call is 10–13 ms at every size.
+Those are measured: the first of the two runs caught the conformance button
+reporting its own 250 ms poll interval as throughput, so arrival times are now
+stamped in the message callback and the stages that cannot measure say
+"within N ms, an upper bound" instead of printing a rate.
 
 ### 2.12.8
 

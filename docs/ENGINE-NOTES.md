@@ -862,6 +862,19 @@ chunks, under a re-entrancy lock, and the conformance run gets a stage that
 publishes 1 MB to a topic nothing echoes back - the experiment that tells the
 echo stall apart from a broken write path. Both are in the next run.
 
+### Thirteenth run, 2026-09-06, OXT on Windows 11 + broker.hivemq.com:8883 over TLS, v2.13.0
+
+**16 passed, 0 failed, 1 skipped**, boot check 14 of 14. TLS and asynchronous
+writes together for the first time, and the first run whose timings are
+measurements rather than poll intervals: **a megabyte round-trips in 522 ms**
+against the 3150 ms of pure pausing 2.12.8 imposed. Detail in section 4.
+
+**Found:** the pacing ladder measured nothing - it set a pause four times while
+asynchronous writes, which never read it, were on. Its "no pacing needed on this
+path" was unearned. The stage now turns asynchronous writes off for its own
+duration and restores them however it exits, which also makes it the only
+engine exercise the synchronous fallback gets.
+
 ### Twelfth run, 2026-09-06, OXT on WINDOWS 11 + broker.hivemq.com:1883, v2.13.0
 
 **15 passed, 0 failed, 2 skipped - the asynchronous write path's first engine
@@ -1175,6 +1188,64 @@ autotuning, which Windows does differently. `mqttSetAsyncWrites false` plus
 ladder then sails through on Windows, the stall is Linux-specific and 1.1 needs
 saying so.
 
+### The thirteenth run: real numbers at last, and a stage that measured nothing
+**OBSERVED 2026-09-06**, OXT on Windows 11, **over verified TLS** to
+broker.hivemq.com:8883, v2.13.0 asynchronous. **16 passed, 0 failed, 1 skipped**,
+and the boot self-check green at 14 of 14 on a properly reopened stack.
+
+**The timing fix worked, and these are measurements rather than poll intervals:**
+
+    payload      round trip   incl. one round trip
+    4096 B          104 ms      38 KB/s
+    16384 B         284 ms      56 KB/s
+    65536 B         286 ms     224 KB/s
+    131072 B        295 ms     434 KB/s
+    204800 B        234 ms     855 KB/s
+    524288 B        319 ms    1605 KB/s
+    1048576 B       522 ms    1962 KB/s
+
+Not one of those is a multiple of the 250 ms tick, which is what the previous
+run's numbers all were. **A megabyte now round-trips in 522 ms**, against
+2.12.8's 3150 ms of pure pausing before any I/O. The write call stayed at
+10-13 ms for every size.
+
+The small rungs measure LATENCY, not throughput: 104 ms for 4 KB is one round
+trip to a broker on the internet, and "38 KB/s" is that latency expressed as a
+rate. Only the large rungs approach the link's real speed. The ladder now says
+`incl. one round trip` so the two are not read as the same quantity.
+
+**Also newly OBSERVED:** TLS carrying the asynchronous path end to end, which
+is TLS and async together for the first time; and a cold-connection effect worth
+recording - the ladder's fresh connection PUBACKed a megabyte within 2762 ms
+while the same payload on the warm run connection took within 763 ms.
+
+**FOUND, and it is the sharpest instrument defect yet: the pacing ladder
+measured nothing at all.** It ran, printed a PASS on its first rung, and said:
+
+    PASS  1048576 bytes ... at a 0ms pause per chunk
+          NOTE: no pacing needed on this path - the engine wrote a megabyte
+          of plaintext straight through.
+
+**Neither claim was tested.** Since 2.13.0 the library writes asynchronously by
+default, and the asynchronous path never reads `gMQTTWriteYieldMs` - the stage
+set the pause four times and changed nothing. Every rung was identical; rung one
+passed because asynchronous writes work, which the rest of the run already
+showed. Worse than useless: a future reader would have taken "no pacing needed
+on this path" as evidence about the synchronous path, and it is evidence about
+nothing.
+
+**Fixed:** the stage now turns asynchronous writes OFF for its own duration and
+restores the previous settings however it exits - including from `ctFinish`, so
+a cancelled run cannot leave the library on the other write path for the rest of
+the session. That makes the ladder a real measurement again, and it also makes
+it **the only exercise the synchronous fallback gets on an engine**, which was
+listed below as still untested.
+
+**So the Kubuntu-versus-Windows question in 1.1 is still open**, and the fixed
+ladder is what will answer it: with asynchronous writes off and a 0 ms pause it
+reproduces the pre-2.12.3 conditions exactly. If a megabyte goes straight
+through on Windows, the stall is Linux-specific.
+
 ### What the next run has to show
 
 1. **The conformance run still passes**, in the same shape as run 11's 17 of 17.
@@ -1189,4 +1260,6 @@ saying so.
    inferred from a poll.
 3. **`mqttSetAsyncWrites false`** must still behave like 2.12.8. If asynchronous
    writes misbehave, that one line is the way back without pinning a version.
-   **Not yet exercised on an engine.**
+   **Still not exercised on an engine** - the thirteenth run was supposed to,
+   and the stage that would have done it was measuring nothing (above). The
+   fixed pacing ladder now drives it on every run.

@@ -61,8 +61,16 @@ constant kCtPort2 = 1883
 -- SO THE EXPERIMENT IS PACING, not size. The same megabyte, over and over, at
 -- an increasing pause between chunks, on its own connection to a second
 -- broker. The answer wanted is the smallest pause at which a megabyte gets
--- through - and if one does, the run keeps that value for everything after it,
--- so the ladder further down becomes a second test of the same fix.
+-- through.
+--
+-- IT TESTS THE SYNCHRONOUS PATH, AND IT HAS TO SAY SO. Since 2.13.0 the
+-- library writes asynchronously by default and the pause is not consulted at
+-- all on that path - so a ladder run against it measures nothing and every rung
+-- is identical. The thirteenth run did exactly that and reported "no pacing
+-- needed on this path" from a rung that never tested pacing. The stage now
+-- turns asynchronous writes OFF for its own duration and puts the previous
+-- settings back however it exits, which also makes it the only exercise the
+-- synchronous fallback gets on an engine.
 --
 -- It runs FIRST because a stall later resets the connection and aborts the
 -- rest, which is exactly when this answer is wanted. Set kCtAltHost to empty
@@ -111,6 +119,7 @@ local sCtBigStep, sCtBigOk   -- the large-payload ladder's position and high-wat
 local sCtWriteMs             -- how long the current rung's write call took
 local sCtT0                  -- when the current rung was published, for the ack time
 local sCtProbeStep           -- the pacing ladder's position in kCtYieldLadder
+local sCtAsyncWas, sCtYieldWas  -- the write settings to put back after the ladder
 local sCtEndedEarly          -- why the run stopped before its last stage, if it did
 
 on mouseUp
@@ -151,6 +160,10 @@ command ctBegin
    put 1 into sCtBigStep
    put 0 into sCtBigOk
    put 1 into sCtProbeStep
+   -- The pacing ladder turns the write settings upside down to do its job.
+   -- Remember them here so it can put them back whichever way it exits.
+   put mqttGetAsyncWrites() into sCtAsyncWas
+   put mqttGetWriteYieldMs() into sCtYieldWas
    put empty into sCtEndedEarly
    put empty into sCtKey2
 
@@ -343,9 +356,9 @@ command ctStageAltWrite
    put the number of items of kCtYieldLadder into tRungs
    if sCtProbeStep > tRungs then
       ctFail "the pacing ladder", kCtAltSize & " bytes never went out at any " \
-            & "pause in " & kCtYieldLadder & "ms - pacing is not the answer, " \
-            & "or not the whole answer"
-      mqttSetWriteYieldMs 0
+            & "pause in " & kCtYieldLadder & "ms with SYNCHRONOUS writes - " \
+            & "pacing is not the answer for this path, or not the whole answer"
+      ctProbeRestore
       ctNext
       exit ctStageAltWrite
    end if
@@ -353,13 +366,16 @@ command ctStageAltWrite
 
    switch sCtPhase
       case 0
+         -- The ladder measures the SYNCHRONOUS path. Asynchronous writes never
+         -- read the pause, so leaving them on would make every rung identical.
+         mqttSetAsyncWrites false
          mqttSetWriteYieldMs tYield
          put mqttConnect(kCtAltHost, kCtAltPort, \
                "libmqttxt-ctprobe-" & the milliseconds, empty, empty, 60, \
                false, true, empty, empty, 0, false, true, false, empty) into tRc
          if tRc is not "OK" then
             ctSkip "the pacing ladder", tRc
-            mqttSetWriteYieldMs 0
+            ctProbeRestore
             ctNext
             exit ctStageAltWrite
          end if
@@ -376,7 +392,7 @@ command ctStageAltWrite
          if sCtTicks >= kCtDeadline then
             ctSkip "the pacing ladder", kCtAltHost & " never reached CONNACK"
             mqttDisconnect kCtAltHost, kCtAltPort
-            mqttSetWriteYieldMs 0
+            ctProbeRestore
             ctNext
          end if
          break
@@ -391,7 +407,7 @@ command ctStageAltWrite
          put tWriteMs into sCtWriteMs
 
          if tRc is not "OK" then
-            ctSay "      pause " & tYield & "ms per chunk: " & tRc \
+            ctSay "      synchronous, pause " & tYield & "ms per chunk: " & tRc \
                   & " (after " & tWriteMs & "ms)"
             mqttDisconnect kCtAltHost, kCtAltPort
             add 1 to sCtProbeStep
@@ -407,20 +423,22 @@ command ctStageAltWrite
          put mqttGetConnectionInfo(kCtAltHost, kCtAltPort) into tInfo
          if tInfo["pendingAcks"] is empty then
             ctPass kCtAltSize & " bytes in the clear to " & kCtAltHost \
-                  & " at a " & tYield & "ms pause per chunk, PUBACKed within " \
-                  & (the milliseconds - sCtT0) & "ms (polled every " \
-                  & kCtTickMs & "ms, so an upper bound; the write call itself " \
-                  & "took " & sCtWriteMs & "ms)"
+                  & ", SYNCHRONOUS writes at a " & tYield & "ms pause per " \
+                  & "chunk, PUBACKed within " & (the milliseconds - sCtT0) \
+                  & "ms (polled every " & kCtTickMs & "ms, so an upper bound; " \
+                  & "the write call itself took " & sCtWriteMs & "ms)"
             if tYield is 0 then
-               ctSay "      NOTE: no pacing needed on this path - the engine " \
-                     & "wrote a megabyte of plaintext straight through. A " \
-                     & "stall below belongs to the broker under test."
+               ctSay "      NOTE: the SYNCHRONOUS path needed no pacing at all " \
+                     & "here - a megabyte of plaintext went straight through " \
+                     & "with mqttSetWriteYieldMs 0. That is the opposite of " \
+                     & "what engine notes 1.1 saw on Kubuntu, so record the " \
+                     & "platform beside this line."
             else
-               ctSay "      NOTE: a " & tYield & "ms pause per chunk is what " \
-                     & "made this go through, and it stays set for the rest " \
-                     & "of the run - so the ladder below now tests the same " \
-                     & "answer against the broker under test."
+               ctSay "      NOTE: " & tYield & "ms per chunk is what the " \
+                     & "SYNCHRONOUS path needs on this link. Set it with " \
+                     & "mqttSetWriteYieldMs if you turn asynchronous writes off."
             end if
+            ctProbeRestore
             mqttDisconnect kCtAltHost, kCtAltPort
             ctNext
             exit ctStageAltWrite
@@ -684,6 +702,15 @@ command ctStageNoEcho
          kCtDeadlineBig
 end ctStageNoEcho
 
+-- Put the write settings back the way the run found them. Called from EVERY
+-- exit of the pacing ladder, because a stage that leaves the library in its
+-- test configuration has changed what every stage after it is measuring - and
+-- the ladder deliberately turns off the write path the rest of the run uses.
+command ctProbeRestore
+   mqttSetAsyncWrites sCtAsyncWas
+   mqttSetWriteYieldMs sCtYieldWas
+end ctProbeRestore
+
 -- One filler payload, built the same way wherever a size is needed. 1 KB of
 -- hex digits repeated: cheap to build, and every byte differs from its
 -- neighbours enough that a truncated or duplicated block shows up in a
@@ -775,8 +802,12 @@ command ctStageBig
          -- enqueue, and the gap between the two is the point.
          local tRtt
          put sCtSeenAt[tTopic] - sCtT0 into tRtt
+         -- The rate INCLUDES one round trip, so a small rung measures latency
+         -- and only a large one approaches throughput: 4 KB at "38 KB/s" and
+         -- 1 MB at "1962 KB/s" on the same link, in the thirteenth run, are
+         -- both honest and they are not the same quantity.
          ctSay "      " & tSize & " bytes round-tripped intact in " & tRtt \
-               & "ms (" & ctRate(tSize, tRtt) \
+               & "ms (" & ctRate(tSize, tRtt) & " incl. one round trip" \
                & "; write call " & sCtWriteMs & "ms)"
       else
          ctFail "large payload at " & tSize & " bytes", "got back " \
@@ -1091,6 +1122,13 @@ end ctSay
 
 command ctFinish
    put false into sCtRunning
+
+   -- The pacing ladder turns asynchronous writes OFF to do its work, and a run
+   -- cancelled or aborted mid-ladder would otherwise leave them off for the
+   -- rest of the engine session - every later stage, and the dashboard itself,
+   -- silently on the other write path. Restoring here covers every exit;
+   -- the ladder's own restore covers the ordinary ones.
+   ctProbeRestore
 
    -- Put the dashboard back the way it was found. The unsubscribe is
    -- conditional because a green run has already unsubscribed in its own
