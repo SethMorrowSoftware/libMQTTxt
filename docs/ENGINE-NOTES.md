@@ -850,6 +850,66 @@ chunks, under a re-entrancy lock, and the conformance run gets a stage that
 publishes 1 MB to a topic nothing echoes back - the experiment that tells the
 echo stall apart from a broken write path. Both are in the next run.
 
+### Eleventh session, 2026-09-06, four runs against mosquitto by two addresses, v2.12.7
+
+Four runs in one engine session, ending at **17 passed, 0 failed, 1 skipped -
+the most complete run of the project.** The operator drove the broker through
+two spellings (`192.168.1.104` and `127.0.0.1`), which is what finally let the
+last untested stage run.
+
+**Newly OBSERVED, and it is the one that had never run:**
+
+- **Two simultaneous connections, with independent keep-alive chains.** The
+  second connection was opened to `192.168.1.104:1883` while the run was
+  connected to `127.0.0.1:1883` - the same mosquitto, two keys, because the
+  library keys a connection by `host:port`. Then both were held idle for 100 s
+  at DIFFERENT keep-alive intervals, 30 s against the dashboard's 60 s:
+
+      PASS  a second connection is live alongside the first
+      PASS  the connection survived 100s idle AND a PINGRESP was received
+      PASS  the SECOND connection also survived - the two keep-alive chains
+            ran on their own schedules
+
+  **This is the timer-token work of 2.12.0 proved on an engine.** Before that
+  fix a single delayed message served every connection, so whichever timer fired
+  first pinged both and the other was serviced on a schedule that was not its
+  own. Two chains on two intervals surviving 100 s each is exactly the
+  observation that could not be made until now, and it is the last stage of the
+  conformance button to go green.
+- **Repeatability.** The whole suite ran green three times over in one session,
+  against two addresses, with packet IDs continuing across runs on a reused
+  connection (21, 22, 23... in the last run) - so the packet-ID allocator does
+  not restart or collide when a connection outlives a run.
+
+**Found, and it is a defect in the harness rather than the library.** A run
+cancelled mid-hold by a second click printed:
+
+    -- run cancelled by a second click --
+          15 passed, 0 failed, 1 skipped - RUN FINISHED
+          conformance run GREEN against 127.0.0.1:1883
+
+**Zero failures is not a pass when the stages that would have failed never
+ran.** This file's own header promises a report that says when it is not
+finished, and `ctFail` already carries that lesson one level up in its cascade
+NOTE; the cancel path was the hole in it. `ctFinish` now records WHY a run
+stopped and prints `RUN NOT FINISHED (<reason>)` with the stage it died on,
+never GREEN. The abort path shares the mechanism.
+
+**Also found:** the pacing ladder skipped in three of these runs because
+`kCtAltHost` had been set to the same address the run was using, and one
+connection per `host:port` is all the library can hold. That is a real
+constraint, so the skip message now names the remedy - another spelling of the
+same broker, which is exactly the trick the operator had already used for
+`kCtHost2`. **The LAN pacing figure is therefore still unmeasured**; every
+50 ms value in these runs came from the hivemq ladder in the first run and
+persisted in the global for the rest of the session.
+
+**Worth knowing for the next run:** these were all v2.12.7, whose default pause
+is 0. The runs only worked because the first ladder set 50 ms and the global
+survived. **On a fresh engine v2.12.7 would fail the large payloads again** -
+v2.12.8's default of 50 is what makes that survive a restart, and it has not
+been run yet.
+
 ### Tenth run, 2026-09-06, OXT + broker.hivemq.com then mosquitto, v2.12.7
 
 **16 passed, 0 failed, 1 skipped - the first fully green conformance run.** The

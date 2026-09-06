@@ -2,13 +2,13 @@
 
 Version 2.12.8 - OXT MQTT 3.1.1 Implementation
 
-> **Status: ten engine runs recorded 2026-09-05/06, the last one fully green -
-> 16 passed, 0 failed.** Compiles and loads on OXT; connects to mosquitto and
-> hivemq, in the clear and over verified TLS. Observed working: QoS 0/1/2 with
-> their acknowledgment legs and exactly-once, UTF-8 and binary payloads,
-> zero-length payloads, retained replay and clear, unsubscribe, keep-alive over
-> 100 s idle, the auto-reconnect back-off, and payloads to 1 MB on two brokers
-> over two networks.
+> **Status: fourteen engine runs recorded 2026-09-05/06, the best one 17 passed,
+> 0 failed.** Compiles and loads on OXT; connects to mosquitto and hivemq, in the
+> clear and over verified TLS. Observed working: QoS 0/1/2 with their
+> acknowledgment legs and exactly-once, UTF-8 and binary payloads, zero-length
+> payloads, retained replay and clear, unsubscribe, keep-alive over 100 s idle,
+> **two simultaneous connections with independent keep-alive chains**, the
+> auto-reconnect back-off, and payloads to 1 MB on two brokers over two networks.
 >
 > **Large writes are rate-limited, by necessity.** The engine's plaintext write
 > stalls if it outruns the link, so a payload larger than the chunk size is paced
@@ -16,8 +16,8 @@ Version 2.12.8 - OXT MQTT 3.1.1 Implementation
 > Smaller payloads are unaffected. `docs/ENGINE-NOTES.md` 1.1 has the ten runs
 > behind that and the case for asynchronous writes as the eventual fix.
 >
-> **Not yet observed:** a reconnect that succeeds, two connections at once, the
-> persistent store, and certificate verification refusing a bad certificate.
+> **Not yet observed:** a reconnect that succeeds, the persistent store, and
+> certificate verification refusing a bad certificate.
 
 ## Table of Contents
 

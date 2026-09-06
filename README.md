@@ -451,10 +451,17 @@ rather than the network. Payloads that fit one chunk are unaffected. Tune it for
 your own path with the conformance button, or wait for asynchronous writes,
 which would pace themselves.
 
-**Still unproven:** a reconnect that *succeeds* and resubscribes;
-multi-connection; the persistent store; and certificate verification rejecting a
-bad certificate. The performance figures below are from 2.11.x and have not been
-re-measured.
+**An eleventh session then ran the last untested stage.** Two simultaneous
+connections to one broker — reached by two spellings of its address, since the
+library keys a connection by `host:port` — were held idle for 100 s at *different*
+keep-alive intervals, 30 s against 60 s, and both survived with their own
+PINGRESPs. That is the 2.12.0 timer-token work proved on an engine: before it, a
+single delayed message served every connection and whichever timer fired first
+pinged both. The best run of the project is **17 passed, 0 failed, 1 skipped.**
+
+**Still unproven:** a reconnect that *succeeds* and resubscribes; the persistent
+store; and certificate verification rejecting a bad certificate. The performance
+figures below are from 2.11.x and have not been re-measured.
 
 ## Performance
 

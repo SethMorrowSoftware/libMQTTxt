@@ -109,10 +109,12 @@ local sCtPhase           -- sub-state within a multi-step stage
 local sCtBigStep, sCtBigOk   -- the large-payload ladder's position and high-water mark
 local sCtWriteMs             -- how long the current rung's write call took
 local sCtProbeStep           -- the pacing ladder's position in kCtYieldLadder
+local sCtEndedEarly          -- why the run stopped before its last stage, if it did
 
 on mouseUp
    if sCtRunning is "true" then
       ctSay "-- run cancelled by a second click --"
+      put "cancelled by a second click" into sCtEndedEarly
       ctFinish
       exit mouseUp
    end if
@@ -146,6 +148,7 @@ command ctBegin
    put 1 into sCtBigStep
    put 0 into sCtBigOk
    put 1 into sCtProbeStep
+   put empty into sCtEndedEarly
    put empty into sCtKey2
 
    -- Unique per run, so a retained message left by an earlier run cannot be
@@ -221,6 +224,7 @@ command ctTick
    if sCtStage < 13 and not mqttIsConnected(sCtHost, sCtPort) then
       ctSay "ABORT  the connection dropped mid-run; nothing below was tested"
       add 1 to sCtFail
+      put "the connection dropped mid-run" into sCtEndedEarly
       ctFinish
       exit ctTick
    end if
@@ -303,9 +307,16 @@ command ctStageAltWrite
       exit ctStageAltWrite
    end if
 
+   -- The library keys a connection by "host:port", so the probe cannot open a
+   -- second one to the address the run is already using. That is a real
+   -- constraint and not a policy, which is why the remedy is spelled out: any
+   -- OTHER spelling of the same broker is a different key and works fine.
    if kCtAltHost is sCtHost and kCtAltPort is sCtPort then
-      ctSkip "the pacing ladder", "kCtAltHost is the broker under test, so it " \
-            & "would prove nothing about the path"
+      ctSkip "the pacing ladder", "kCtAltHost is " & sCtHost & ":" & sCtPort \
+            & ", the same address this run is connected to, and one connection " \
+            & "per host:port is all the library can hold - set kCtAltHost to " \
+            & "ANOTHER SPELLING of the same broker (127.0.0.1 against a form " \
+            & "saying localhost or its LAN IP, or the reverse) to pace this path"
       ctNext
       exit ctStageAltWrite
    end if
@@ -1046,6 +1057,23 @@ command ctFinish
    mqttSetMessageCallback "mdOnMessage"
    if mqttGetSubscriptions(sCtHost, sCtPort) contains (sCtBase & "/#") then
       get mqttUnsubscribe(sCtHost, sCtPort, sCtBase & "/#")
+   end if
+
+   -- A RUN THAT STOPPED EARLY IS NOT A RUN THAT PASSED, and this printed
+   -- "RUN FINISHED ... GREEN" on a run cancelled mid-hold until the eleventh
+   -- engine session showed it doing exactly that. Zero failures is not a pass
+   -- when the stages that would have failed never ran - which is the same
+   -- lesson as the cascade NOTE in ctFail, one level up. The header of this
+   -- file promises a report that says when it is not finished; this is where
+   -- that promise was being broken.
+   if sCtEndedEarly is not empty then
+      ctSay "      " & sCtPass & " passed, " & sCtFail & " failed, " \
+            & sCtSkip & " skipped - RUN NOT FINISHED (" & sCtEndedEarly & ")"
+      ctSay "      stage " & sCtStage & " of 13 was in progress and the stages " \
+            & "after it never ran, so this is NOT a pass whatever the count says"
+      uiStatus "Conformance run STOPPED at stage " & sCtStage & " of 13 - " \
+            & "incomplete.", "warn"
+      exit ctFinish
    end if
 
    ctSay "      " & sCtPass & " passed, " & sCtFail & " failed, " \
