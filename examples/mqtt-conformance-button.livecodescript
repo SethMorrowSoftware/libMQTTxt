@@ -23,10 +23,11 @@
 -- Every render carries "RUN NOT FINISHED" until the last stage closes it.
 --
 -- NOTHING HERE IS DESTRUCTIVE TO YOUR BROKER. Every topic lives under
--- libmqttxt/ct/<milliseconds>/ or libmqttxt/ctquiet/<milliseconds>/, unique per
--- run, and the one retained message it sets is cleared before the run ends.
--- The ctquiet tree is deliberately OUTSIDE the run's own subscription; see
--- ctStageNoEcho for what that is for.
+-- libmqttxt/ct/<milliseconds>/, libmqttxt/ctquiet/<milliseconds>/ or
+-- libmqttxt/ctprobe/<milliseconds>, unique per run, and the one retained
+-- message it sets is cleared before the run ends. The ctquiet tree is
+-- deliberately OUTSIDE the run's own subscription; see ctStageNoEcho for what
+-- that is for. The ctprobe topic goes to a second broker entirely.
 
 -- The second broker for the multi-connection stage. The library keys a
 -- connection by "host:port", so TWO connections to one broker are impossible by
@@ -38,6 +39,27 @@
 -- Leave it empty and the stage records SKIP with the reason.
 constant kCtHost2 = ""
 constant kCtPort2 = 1883
+
+-- THE WRITE-PATH PROBE, and it is the first thing the run does.
+--
+-- The eighth engine run stalled a 1 MB publish against a local mosquitto with
+-- nothing subscribed to the topic, so the stall is not the broker blocking on
+-- an echo. What is left is the broker, the network path, or the engine's own
+-- plaintext write path - and the same engine carried 1 MB to hivemq over TLS.
+--
+-- So: the same 1 MB, in the clear, to a DIFFERENT broker over a DIFFERENT
+-- path, on its own connection, before anything else in the run.
+--   it passes -> the engine writes a megabyte of plaintext fine, and the
+--                stall belongs to the broker under test or the path to it
+--   it fails  -> the engine's plaintext write path is the suspect; TLS is the
+--                only shape that has ever carried this much
+--
+-- It runs FIRST because a stall later in the run resets the connection and
+-- aborts everything after it - which is exactly when this answer is wanted.
+-- Set kCtAltHost to empty to skip it.
+constant kCtAltHost = "broker.hivemq.com"
+constant kCtAltPort = 1883
+constant kCtAltSize = 1048576
 
 -- How long the idle hold runs. It must exceed the ping threshold (keep-alive x
 -- mqttGetKeepAliveThreshold, so 45s at the dashboard's defaults) with room for
@@ -143,6 +165,7 @@ command ctBegin
    -- value belongs in the record beside any size that fails.
    ctSay "   socketTimeoutInterval " & the socketTimeoutInterval & "ms"
    ctSay "   write chunk size " & mqttGetWriteChunkSize() & " bytes"
+   ctSay "   write yield " & mqttGetWriteYieldMs() & "ms per chunk"
 
    send "ctTick" to me in kCtTickMs milliseconds
 end ctBegin
@@ -169,7 +192,7 @@ command ctTick
 
    -- A dropped link mid-run invalidates everything after it, so say so and stop
    -- rather than reporting a cascade of timeouts that all have one cause.
-   if sCtStage < 12 and not mqttIsConnected(sCtHost, sCtPort) then
+   if sCtStage < 13 and not mqttIsConnected(sCtHost, sCtPort) then
       ctSay "ABORT  the connection dropped mid-run; nothing below was tested"
       add 1 to sCtFail
       ctFinish
@@ -180,39 +203,42 @@ command ctTick
 
    switch sCtStage
       case 1
-         ctStageSubscribe
+         ctStageAltWrite
          break
       case 2
-         ctStageRoundTrip "q0", 0, "QoS 0 round trip"
+         ctStageSubscribe
          break
       case 3
-         ctStageRoundTrip "q1", 1, "QoS 1 round trip (PUBACK)"
+         ctStageRoundTrip "q0", 0, "QoS 0 round trip"
          break
       case 4
-         ctStageRoundTrip "q2", 2, "QoS 2 round trip (PUBREC/PUBREL/PUBCOMP)"
+         ctStageRoundTrip "q1", 1, "QoS 1 round trip (PUBACK)"
          break
       case 5
-         ctStageUtf8
+         ctStageRoundTrip "q2", 2, "QoS 2 round trip (PUBREC/PUBREL/PUBCOMP)"
          break
       case 6
-         ctStageBinary
+         ctStageUtf8
          break
       case 7
-         ctStageNoEcho
+         ctStageBinary
          break
       case 8
-         ctStageBig
+         ctStageNoEcho
          break
       case 9
-         ctStageRetained
+         ctStageBig
          break
       case 10
-         ctStageUnsubscribe
+         ctStageRetained
          break
       case 11
-         ctStageSecondConnection
+         ctStageUnsubscribe
          break
       case 12
+         ctStageSecondConnection
+         break
+      case 13
          ctStageHold
          break
       default
@@ -226,6 +252,104 @@ command ctTick
 end ctTick
 
 -- ---- stages ---------------------------------------------------------------
+
+-- THE WRITE-PATH PROBE. See kCtAltHost at the top for why this exists and what
+-- each outcome means. It runs on its OWN connection to a second broker, so
+-- nothing it does can disturb the run that follows, and it runs first so that a
+-- stall later - which aborts everything after it - cannot cost us this answer.
+--
+-- A broker that cannot be reached is a SKIP, not a failure: no internet is not
+-- a finding about this library. A broker that accepts the connection and then
+-- stalls the write IS a finding.
+command ctStageAltWrite
+   local tRc, tInfo, tT0, tWriteMs
+
+   if kCtAltHost is empty then
+      ctSkip "the write-path probe", "no kCtAltHost set at the top of this script"
+      ctNext
+      exit ctStageAltWrite
+   end if
+
+   if kCtAltHost is sCtHost and kCtAltPort is sCtPort then
+      ctSkip "the write-path probe", "kCtAltHost is the broker under test, so " \
+            & "it would prove nothing"
+      ctNext
+      exit ctStageAltWrite
+   end if
+
+   switch sCtPhase
+      case 0
+         put mqttConnect(kCtAltHost, kCtAltPort, \
+               "libmqttxt-ctprobe-" & the milliseconds, empty, empty, 60, \
+               false, true, empty, empty, 0, false, true, false, empty) into tRc
+         if tRc is not "OK" then
+            ctSkip "the write-path probe", tRc
+            ctNext
+            exit ctStageAltWrite
+         end if
+         put 1 into sCtPhase
+         put 0 into sCtTicks
+         break
+
+      case 1
+         if mqttIsConnected(kCtAltHost, kCtAltPort) then
+            put 2 into sCtPhase
+            put 0 into sCtTicks
+            exit ctStageAltWrite
+         end if
+         if sCtTicks >= kCtDeadline then
+            ctSkip "the write-path probe", kCtAltHost & " never reached CONNACK"
+            mqttDisconnect kCtAltHost, kCtAltPort
+            ctNext
+         end if
+         break
+
+      case 2
+         put ctPayload(kCtAltSize) into sCtBig
+         put the milliseconds into tT0
+         put mqttPublish(kCtAltHost, kCtAltPort, \
+               "libmqttxt/ctprobe/" & the milliseconds, sCtBig, 1, false) into tRc
+         put the milliseconds - tT0 into tWriteMs
+         put tWriteMs into sCtWriteMs
+
+         if tRc is not "OK" then
+            ctFail "the write-path probe: " & kCtAltSize & " bytes in the " \
+                  & "clear to " & kCtAltHost, tRc & " (the write call took " \
+                  & tWriteMs & "ms)"
+            ctSay "      NOTE: a large plaintext write stalls against a SECOND " \
+                  & "broker over a DIFFERENT path too. That points at the " \
+                  & "engine's plaintext write path, not at any one broker - " \
+                  & "and TLS is the only shape that has carried this size."
+            mqttDisconnect kCtAltHost, kCtAltPort
+            ctNext
+            exit ctStageAltWrite
+         end if
+         put 3 into sCtPhase
+         put 0 into sCtTicks
+         break
+
+      case 3
+         put mqttGetConnectionInfo(kCtAltHost, kCtAltPort) into tInfo
+         if tInfo["pendingAcks"] is empty then
+            ctPass "the write-path probe: " & kCtAltSize & " bytes written in " \
+                  & "the clear to " & kCtAltHost & " and PUBACKed (write call " \
+                  & sCtWriteMs & "ms, " & ctRate(kCtAltSize, sCtWriteMs) & ")"
+            ctSay "      NOTE: the engine writes a megabyte of plaintext " \
+                  & "without stalling, so a stall below belongs to the broker " \
+                  & "under test or to the path to it."
+            mqttDisconnect kCtAltHost, kCtAltPort
+            ctNext
+            exit ctStageAltWrite
+         end if
+         if sCtTicks >= kCtDeadlineBig then
+            ctFail "the write-path probe", "no PUBACK from " & kCtAltHost \
+                  & " for " & kCtAltSize & " bytes"
+            mqttDisconnect kCtAltHost, kCtAltPort
+            ctNext
+         end if
+         break
+   end switch
+end ctStageAltWrite
 
 command ctStageSubscribe
    local tRc

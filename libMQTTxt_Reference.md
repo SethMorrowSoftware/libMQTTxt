@@ -1,19 +1,19 @@
 # MQTT Client Library Reference
 
-Version 2.12.6 - OXT MQTT 3.1.1 Implementation
+Version 2.12.7 - OXT MQTT 3.1.1 Implementation
 
-> **Status: seven engine runs recorded 2026-09-05/06.** Compiles and loads on
+> **Status: eight engine runs recorded 2026-09-05/06.** Compiles and loads on
 > OXT; connects to mosquitto and hivemq, in the clear and over verified TLS; QoS
 > 0/1/2, UTF-8 and binary payloads, retained, unsubscribe, keep-alive and the
 > auto-reconnect back-off are observed working, and payloads to 1 MB round-trip
 > over the internet path.
 >
-> **One open defect:** a large publish to a topic the client is itself
-> subscribed to can stall on a low-latency (LAN) path. 2.12.6 yields to the
-> event loop between chunks to break the stall; that fix has not yet run on an
-> engine. See `docs/ENGINE-NOTES.md` 1.1. Not yet observed either: a reconnect
-> that succeeds, two connections at once, the persistent store, and certificate
-> verification refusing a bad certificate.
+> **One open defect, cause not established:** on a low-latency plaintext path to
+> a local mosquitto, a publish of roughly 100 KB or more may stall and reset the
+> connection. Two explanations have been tested and refuted; 2.12.7 ships the
+> experiments for the rest. See `docs/ENGINE-NOTES.md` 1.1. Not yet observed
+> either: a reconnect that succeeds, two connections at once, the persistent
+> store, and certificate verification refusing a bad certificate.
 
 ## Table of Contents
 
@@ -301,6 +301,46 @@ Control packets and small publishes are never affected.
 ```OXT
 mqttSetWriteChunkSize 8192  -- yield more often on a constrained path
 ```
+
+---
+
+### mqttSetWriteYieldMs
+
+Set how long a large write pauses between chunks, in milliseconds.
+
+```OXT
+mqttSetWriteYieldMs pMilliseconds
+```
+
+**Parameters:**
+- `pMilliseconds` - 0 to 1000 (default 0)
+
+**Zero is not "no pause".** It is a yield: one turn of the engine's event loop,
+costing pending messages their run and no elapsed time.
+
+**A non-zero value is a diagnostic, not a setting to leave on.** A large publish
+can still stall on a low-latency plaintext path with no inbound traffic to
+explain it (`docs/ENGINE-NOTES.md` 1.1). One reading still standing is that the
+engine needs real elapsed time, rather than merely a turn of the loop, to push
+what it has already accepted. This makes that testable. It costs the given delay
+per chunk, so a 1 MB payload at 16 KB chunks and 20 ms adds 1.3 seconds.
+
+**Example:**
+```OXT
+mqttSetWriteYieldMs 20   -- then retry the publish that stalled
+```
+
+---
+
+### mqttGetWriteYieldMs
+
+Get the current inter-chunk yield in milliseconds.
+
+```OXT
+put mqttGetWriteYieldMs() into tMs
+```
+
+**Returns:** Integer
 
 ---
 
@@ -882,7 +922,7 @@ function mqttTestLibrary()
 **Example:**
 ```OXT
 put mqttTestLibrary()
--- Returns: "MQTT Library v2.12.6 loaded successfully"
+-- Returns: "MQTT Library v2.12.7 loaded successfully"
 ```
 
 ---
