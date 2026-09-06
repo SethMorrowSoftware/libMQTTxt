@@ -14,9 +14,13 @@ Version 2.13.0 - OXT MQTT 3.1.1 Implementation
 > chunk at a time as the engine reports each one done, which paces them at the
 > link's own rate. `mqttPublish` returning "OK" therefore means QUEUED; the
 > acknowledgment is what proves delivery. `mqttSetAsyncWrites false` falls back
-> to the paced synchronous path of 2.12.8. **This path has not yet run on an
-> engine** - `docs/ENGINE-NOTES.md` section 4 has the design, the risk it
-> carries, and what a run has to show.
+> to the paced synchronous path of 2.12.8. **Observed working 2026-09-06** on
+> Windows 11: 15 passed, 0 failed, a megabyte round trip in under 765 ms.
+> `docs/ENGINE-NOTES.md` section 4 has the design and the ordering risk it
+> carries.
+>
+> **Platforms observed:** Kubuntu and Windows 11, with no behavioural difference
+> between them.
 >
 > **Not yet observed:** a reconnect that succeeds, the persistent store, and
 > certificate verification refusing a bad certificate.

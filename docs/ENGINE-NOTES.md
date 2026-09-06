@@ -26,6 +26,14 @@ Each entry carries a class, and the class is the point:
 ### 1.1 A failed socket write does not throw
 **OBSERVED 2026-09-05**, against mosquitto at 192.168.1.104:1883.
 
+> **PLATFORM CAVEAT, added after the twelfth run.** Every observation in this
+> entry - all ten runs of it - was made on **Kubuntu**. The reading it arrives
+> at involves the kernel's TCP send-buffer autotuning, which Windows does
+> differently, and the first Windows run used asynchronous writes and so never
+> exercised the stall. **Whether any of this applies off Linux is untested.**
+> `mqttSetAsyncWrites false` with `mqttSetWriteYieldMs 0` reproduces the
+> pre-2.12.3 conditions exactly and would settle it in one run.
+
 A 204800-byte QoS 1 PUBLISH was written. `mqttPublish` returned `OK` and logged
 `Published: ... (204800 bytes, QoS 1)`. Nothing came back - not the echo, not
 the PUBACK. **Nor did anything else come back for the rest of the session:** the
@@ -854,6 +862,35 @@ chunks, under a re-entrancy lock, and the conformance run gets a stage that
 publishes 1 MB to a topic nothing echoes back - the experiment that tells the
 echo stall apart from a broken write path. Both are in the next run.
 
+### Twelfth run, 2026-09-06, OXT on WINDOWS 11 + broker.hivemq.com:1883, v2.13.0
+
+**15 passed, 0 failed, 2 skipped - the asynchronous write path's first engine
+run, and the project's first run on anything but Kubuntu.** Both worked. The
+detail is in section 4; the headline is that the queue keeps order on a real
+engine and the 3150 ms pacing floor is gone.
+
+**Newly OBSERVED:**
+
+- **Asynchronous writes end to end.** Nineteen packets interleaved with
+  PINGREQs, SUBSCRIBEs and UNSUBSCRIBEs across a ladder up to 1 MB, every one
+  acknowledged in sequence, no corruption and nothing discarded.
+- **Windows 11.** No platform-specific behaviour anywhere - framing, timer
+  routing, keep-alive and the QoS 2 interleaving of 1.3 all identical to
+  Kubuntu.
+- **A megabyte round trip in under 765 ms**, against a floor of 3150 ms that
+  2.12.8's pacing imposed arithmetically.
+
+**Found in the harness:** the stages were reporting their own poll interval as
+throughput - every duration a whole number of 250 ms ticks, and "15 KB/s" for a
+4 KB payload the synchronous runs carried in 12 ms. Arrival times are now
+stamped in the message callback, and the two stages that cannot stamp say
+"within Nms, an upper bound" and print no rate (section 4).
+
+**Not tested here:** the pacing ladder skipped (`kCtAltHost` was the broker
+under test), multi-connection skipped (`kCtHost2` empty), and `preOpenStack`
+did not fire because the script was applied to an open stack rather than
+reopened - 2.1 behaving as documented.
+
 ### Eleventh session, 2026-09-06, four runs against mosquitto by two addresses, v2.12.7
 
 Four runs in one engine session, ending at **17 passed, 0 failed, 1 skipped -
@@ -1075,15 +1112,81 @@ starkest case: no turn of the event loop ever follows it, so a queued write
 would never run at all. Anything still queued at that moment is abandoned
 deliberately and logged; a QoS 1 or 2 message among it is still in `pendingAcks`.
 
+### The twelfth run: it works, on Windows, first time
+**OBSERVED 2026-09-06**, OXT on **Windows 11** - the first run of this project
+on anything but Kubuntu - against broker.hivemq.com:1883 in the clear.
+**15 passed, 0 failed, 2 skipped.**
+
+Every stage that has ever run passed, with the asynchronous path carrying all of
+it: SUBSCRIBE/SUBACK, QoS 0/1/2 with their acknowledgment legs and
+exactly-once, UTF-8, all 256 byte values, a megabyte echoed and a megabyte
+un-echoed, the whole size ladder, retained replay and clear, unsubscribe with
+its negative check, and keep-alive across 100 s idle.
+
+**What this establishes:**
+
+- **The queue keeps order on a real engine.** That was the whole risk: a
+  control packet overtaking a half-written publish desynchronises the broker's
+  framing silently, and it would show up as a stalled or nonsensical stage
+  rather than a slow one. Nineteen packets went out interleaved with PINGREQs,
+  SUBSCRIBEs and UNSUBSCRIBEs across a megabyte-scale ladder, and every one was
+  acknowledged in sequence. No `Discarding N queued bytes`, no queue-full
+  refusal, no corruption.
+- **The write call is an enqueue, as designed.** 11-14 ms for every payload
+  from 4 KB to 1 MB, where 2.12.8 took 3289 ms for the megabyte.
+- **The pacing floor is gone, and this part is arithmetic rather than
+  measurement.** Under 2.12.8 a megabyte is 64 chunks, so 63 pauses of 50 ms:
+  **3150 ms of pure sleeping before any I/O, on any platform.** The same
+  payload now completes, round trip, in under 765 ms. The comparison holds
+  even though the platform changed, because the floor was never a property of
+  the machine.
+- **The library runs on Windows.** No platform-specific behaviour appeared
+  anywhere: same framing, same timer routing, same keep-alive, same QoS 2
+  interleaving described in 1.3.
+
+**FOUND, and it is the instrument rather than the library.** The run reported
+throughputs that are not measurements:
+
+    4096 B      262ms   "15 KB/s"
+    16384 B     513ms   "31 KB/s"
+    204800 B    261ms   "766 KB/s"
+    1048576 B   765ms   "1339 KB/s"
+
+Every one of those durations is within 15 ms of a whole number of `kCtTickMs`
+(250 ms) - 1.05, 2.05, 1.04, 3.06 ticks. **The stages were measuring their own
+poll interval.** A 4 KB round trip did not take 262 ms; it took something under
+262 ms, and dividing by that produced "15 KB/s" for a payload the synchronous
+runs carried in 12 ms. Reporting a rate derived from a polled duration is the
+same error as reporting a PASS that was never earned, and this file's whole
+convention is against it.
+
+**Fixed:** `ctOnMessage` now stamps the arrival time the moment a message
+lands, so the echo-based ladder reports a true millisecond round trip. The two
+PUBACK-only stages have no callback to stamp - nothing fires when a PUBACK
+arrives - so they now say `PUBACKed within Nms (polled every 250ms, so an upper
+bound)` and print **no rate at all**. `ctRate` carries a comment saying it may
+only be called on a measured duration.
+
+**Still not known, and Windows makes it cheap to find out:** whether the
+plaintext write stall of 1.1 exists on this platform at all. Every observation
+of it was on Kubuntu, and the reading involves the kernel's send-buffer
+autotuning, which Windows does differently. `mqttSetAsyncWrites false` plus
+`mqttSetWriteYieldMs 0` reproduces the pre-2.12.3 conditions exactly; if the
+ladder then sails through on Windows, the stall is Linux-specific and 1.1 needs
+saying so.
+
 ### What the next run has to show
 
 1. **The conformance run still passes**, in the same shape as run 11's 17 of 17.
    Ordering is the risk; a broken queue shows up as a stalled or nonsensical
-   stage, not as a slow one.
+   stage, not as a slow one. **Met by the twelfth run** - 15 of 15 on Windows.
 2. **The ack times.** Under 2.12.8 every rung reported ~311 KB/s because the
    pause set it. If the queue works, the megabyte's time-to-PUBACK should fall
-   towards the ~139 ms of real write work the tenth run measured. The
-   conformance button now prints time-to-acknowledgment beside the write call
-   for exactly this comparison.
+   towards the ~139 ms of real write work the tenth run measured. **Met, with a
+   caveat the run itself exposed:** a megabyte round-trips in under 765 ms
+   against 2.12.8's 3150 ms floor of pure sleeping, but the finer figures were
+   quantised to the poll interval and are now measured properly rather than
+   inferred from a poll.
 3. **`mqttSetAsyncWrites false`** must still behave like 2.12.8. If asynchronous
    writes misbehave, that one line is the way back without pinning a version.
+   **Not yet exercised on an engine.**
