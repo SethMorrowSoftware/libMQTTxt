@@ -117,17 +117,86 @@ designed instead of a connection that answers nothing.
   would refuse the same size every time. What varies run to run is the kernel's
   send-buffer size (TCP autotuning), which fits a cliff that moves.
 
-**What is NOT yet established:** why the remote stops draining. The test
-subscribes to its own topic, so every publish is echoed back over the same
-socket - and a synchronous write blocks the engine's event loop, so nothing on
-this side reads while it waits. Whether that pairing is a flow-control deadlock
-(each side waiting for the other to read) is the leading candidate and is
-UNPROVEN. The design decision this forces - whether the write path should stop
-blocking the engine at all - is under review; see the entry that follows this
-one when it lands.
+**The mechanism, INFERRED (2026-09-06).** Three independent analyses of the
+four runs converged on one reading, and it is not the one this entry led with.
+The engine's synchronous `write ... to socket` makes ONE non-blocking `send()`.
+What fits in the kernel's TCP send buffer is accepted in memcpy time - the flat
+12-16 ms. What does not fit is **never re-sent**: the wait loop runs to its
+deadline, sets `the result` to `timeout`, and discards the unsent tail with the
+socket still open. That is runs 1 and 3 exactly, and it is why the connection
+looked alive while dead inbound.
+
+Why this over the alternatives:
+
+- **Not an echo deadlock** (each side blocked waiting for the other to read).
+  A deadlock would be MORE likely over the slow hivemq path, which passed
+  200 KB. And run 3's later small writes were accepted by the kernel, which a
+  two-sided jam would have blocked too.
+- **Not a broker limit.** Fixed limits refuse the same size every time; this
+  ceiling moved.
+- **Not a slow write path.** Flat timing to the cliff, zero progress after it.
+  Raising `socketTimeoutInterval` to 20000 (onionxt's handshake value) would
+  fail at 20056 ms instead of 10056.
+- **The moving ceiling** is the kernel send buffer's free space under TCP
+  autotuning: Linux starts `tcp_wmem` at 16 KB and grows it with connection
+  history; macOS starts at 128 KB. It grows larger over a long-RTT internet
+  path, which is why hivemq fitted 200 KB. **No single write size is safe on a
+  cold connection** - a 64 KB publish can fail on a fresh socket.
+
+Evidence class is INFERRED and stays there: the timings are observed, the
+send() mechanism is recollection of engine source by an analysis whose file
+reads were blocked by a harness fault, so it could not cite a line. It is the
+reading that fits every observation, and the fix below is also the experiment
+that tests it.
+
+**The decision (v2.12.3): chunked synchronous writes.** `__writeSocket` now
+hands the kernel no more than `gMQTTWriteChunkSize` bytes per `write` (default
+16 KB, the smallest cold buffer either platform starts with), checking `the
+result` after each. Between chunks the kernel drains the earlier ones to the
+wire on its own - that is TCP, not the engine - so each chunk meets a buffer
+with room. The conformance ladder now runs to 1 MB, well past any send buffer:
+
+- **1 MB round-trips** - the mechanism above is confirmed, and fixed.
+- **a chunk still blocks** - the peer genuinely stopped draining, the mechanism
+  above is wrong, and the echo-deadlock reading comes back.
+
+The error text now carries the measurement: `timeout after 131072 of 204800
+bytes`, not `timeout`.
+
+**Why not asynchronous writes** (`write ... with message`), which was the first
+design put forward: the engine discards a queued write on `close socket` - two
+candidate behaviours were identified and neither flushes reliably - and both
+disconnect paths write DISCONNECT then close on the next line. An async
+DISCONNECT would be dropped, the broker would see a bare TCP close, and **every
+clean disconnect would publish the Last Will.** `mqttCleanupAll` at shutdown is
+the starkest case: no event-loop turn ever follows it. Chunked sync keeps the
+guarantee those paths rely on, changes nothing about what `OK` means, and stays
+on the mechanism four runs have exercised. Async remains the fallback if the
+1 MB rung fails.
 
 **Still worth checking on the mosquitto side:** `message_size_limit` in
 `mosquitto.conf` and `conf.d/`, if only to close that door formally.
+
+### 1.4 A DISCONNECT written just before `close socket` may not reach the broker
+**INFERRED (2026-09-06), not yet observed, recorded so it is not lost.**
+
+Both disconnect paths write DISCONNECT (`0xE0 0x00`) and close the socket on the
+next line. That is correct only because the write is synchronous - the kernel
+has the bytes and `close(2)` sends FIN after them. But if UNREAD inbound data is
+sitting in the receive buffer at `close(2)`, Linux and BSD send RST instead of
+FIN and may discard unsent outbound data. The conformance run subscribes to its
+own topic tree, so an echoed PUBLISH is often pending inbound at exactly the
+moment `mqttDisconnect` runs - and a lost DISCONNECT is an unclean disconnect to
+the broker, which then publishes the Last Will on what the client logged as a
+clean exit.
+
+The robust sequence, which MQTT 3.1.1 section 3.14.4 anticipates, is: write
+DISCONNECT, then wait briefly for the broker's `socketClosed` (or drain pending
+inbound) before closing locally. Not implemented: it changes `mqttDisconnect`
+from immediate to deferred, and this is an inference with no observed LWT
+misfire behind it. **The test that would settle it:** connect with a Will, hold
+a second subscriber on the Will topic, run the ladder, disconnect - the second
+subscriber must NOT receive the Will.
 
 ### 1.2 `secure socket ... with verification` reports success on a plaintext port
 **OBSERVED 2026-09-05.** `secure socket` was applied to a connection on port

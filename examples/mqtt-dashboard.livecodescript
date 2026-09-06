@@ -78,6 +78,7 @@ global gMQTTCallbackTarget        -- Target stack/object for callbacks
 global gMQTTKeepAliveThreshold    -- When to send PINGREQ (0-1, default 0.75 = 75%)
 global gMQTTTimerTokens           -- Maps a numeric timer token to its connection ID
 global gMQTTTimerSeq              -- Monotonic counter that mints timer tokens
+global gMQTTWriteChunkSize        -- Largest single write handed to the kernel (bytes)
 
 -- ========================================
 -- LIBRARY INITIALIZATION
@@ -133,6 +134,13 @@ command mqttInitialize
 
    if gMQTTTimerSeq is empty then
       put 0 into gMQTTTimerSeq
+   end if
+
+   -- 16 KB is the Linux kernel's DEFAULT initial TCP send buffer (tcp_wmem's
+   -- middle value) and well under macOS's 128 KB, so a chunk this size fits a
+   -- cold connection's buffer on both. See __writeSocket for why that matters.
+   if gMQTTWriteChunkSize is empty then
+      put 16384 into gMQTTWriteChunkSize
    end if
 end mqttInitialize
 
@@ -231,6 +239,32 @@ command mqttSetMaxBufferSize pBytes
    end if
    __mqttLog "Maximum buffer size set to:" && gMQTTMaxBufferSize && "bytes"
 end mqttSetMaxBufferSize
+
+command mqttSetWriteChunkSize pBytes
+   -- The knob the conformance ladder turns. Small enough to fit a cold kernel
+   -- send buffer is the point; there is no upper limit worth enforcing beyond
+   -- keeping it a sane number, because a huge value simply reproduces the
+   -- single-write behaviour this replaced, which is a legitimate thing to want
+   -- to demonstrate.
+   if pBytes is not a number then
+      __mqttLog "ERROR: Write chunk size must be a number; keeping" && gMQTTWriteChunkSize
+      exit mqttSetWriteChunkSize
+   end if
+
+   if pBytes < 512 then
+      __mqttLog "WARNING: Write chunk size below 512 bytes; using 512"
+      put 512 into gMQTTWriteChunkSize
+   else if pBytes > 268435455 then
+      put 268435455 into gMQTTWriteChunkSize
+   else
+      put trunc(pBytes) into gMQTTWriteChunkSize
+   end if
+   __mqttLog "Write chunk size set to:" && gMQTTWriteChunkSize && "bytes"
+end mqttSetWriteChunkSize
+
+function mqttGetWriteChunkSize
+   return gMQTTWriteChunkSize
+end mqttGetWriteChunkSize
 
 command mqttSetPersistentStore pEnabled, pStorePath
    put pEnabled into gMQTTPersistentStoreEnabled
@@ -872,7 +906,7 @@ command mqttCleanupAll
 end mqttCleanupAll
 
 function mqttTestLibrary
-   return "MQTT Library v2.12.2 loaded successfully"
+   return "MQTT Library v2.12.3 loaded successfully"
 end mqttTestLibrary
 
 function mqttSelfTest
@@ -1005,7 +1039,7 @@ function mqttSelfTest
    -- Summary
    put "MQTT Library Self-Test" & return into tResults
    put "=====================" & return after tResults
-   put "Version: 2.12.2" & return after tResults
+   put "Version: 2.12.3" & return after tResults
    put "Passed:" && tPassed & return after tResults
    put "Failed:" && tFailed & return after tResults
 
@@ -1450,17 +1484,63 @@ end __cleanupConnection
 -- while the client sees clean writes and a socket the engine still calls open.
 -- The connection is dead in one direction and nothing on either side says so.
 private function __writeSocket pSocketID, pPacket
-   local tError, tRes
-   try
-      write pPacket to socket pSocketID
-   catch tError
-      return tError
-   end try
-
-   put the result into tRes
-   if tRes is not empty then
-      return tRes
+   -- CHUNKED, and the chunk size is the whole fix.
+   --
+   -- FOUR ENGINE RUNS (2026-09-05, docs/ENGINE-NOTES.md 1.1) showed a
+   -- synchronous write completing in a flat 12-16 ms at every size up to
+   -- 128 KB and then blocking for the ENTIRE socketTimeoutInterval at 200 KB,
+   -- with the ceiling moving between runs on the same broker. The reading
+   -- that fits all of it: the engine's synchronous write makes ONE
+   -- non-blocking send(); what fits in the kernel's TCP send buffer is
+   -- accepted in memcpy time, and what does not fit is never re-sent - the
+   -- wait loop runs to its deadline, sets `the result` to "timeout", and
+   -- discards the unsent tail with the socket still open. The ceiling moves
+   -- because the buffer is autotuned from connection history, so NO single
+   -- write size is safe on a cold connection.
+   --
+   -- So no write here is ever larger than a chunk the kernel can take whole.
+   -- Between chunks the kernel is draining the earlier ones to the wire on its
+   -- own (that is TCP, not the engine), so each chunk meets a buffer with room.
+   -- This is also the experiment that tells the two remaining hypotheses
+   -- apart: if the peer had genuinely stopped reading, a chunk would still
+   -- block. Classed INFERRED until a run with chunking round-trips a payload
+   -- larger than the old ceiling.
+   --
+   -- Synchronous on purpose. `write ... with message` would not block the
+   -- engine, but the engine discards a queued write on `close socket`, and
+   -- both disconnect paths write DISCONNECT then close on the next line - an
+   -- async DISCONNECT would be dropped and every clean disconnect would fire
+   -- the Last Will. Chunking keeps the guarantee those paths rely on.
+   --
+   -- Returns empty on success, or the error text WITH how much had gone out,
+   -- because "timeout after 131072 of 204800 bytes" is a measurement and
+   -- "timeout" is a symptom.
+   local tError, tRes, tTotal, tPos, tEnd, tChunkSize
+   put the number of bytes of pPacket into tTotal
+   if tTotal is 0 then
+      return empty
    end if
+
+   put gMQTTWriteChunkSize into tChunkSize
+   if tChunkSize is not a number or tChunkSize < 512 then
+      put 16384 into tChunkSize
+   end if
+
+   put 1 into tPos
+   repeat while tPos <= tTotal
+      put min(tPos + tChunkSize - 1, tTotal) into tEnd
+      try
+         write (byte tPos to tEnd of pPacket) to socket pSocketID
+      catch tError
+         return tError && "after" && (tPos - 1) && "of" && tTotal && "bytes"
+      end try
+
+      put the result into tRes
+      if tRes is not empty then
+         return tRes && "after" && (tPos - 1) && "of" && tTotal && "bytes"
+      end if
+      put tEnd + 1 into tPos
+   end repeat
    return empty
 end __writeSocket
 

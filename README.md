@@ -242,6 +242,10 @@ mqttSetKeepAliveThreshold 0.75
 -- Set maximum buffer size (5MB default)
 mqttSetMaxBufferSize 5242880
 
+-- Largest single socket write handed to the kernel (16KB default). Lower it
+-- if large publishes time out on a cold connection; see docs/ENGINE-NOTES.md 1.1
+mqttSetWriteChunkSize 16384
+
 -- Enable persistent storage for QoS 1/2
 mqttSetPersistentStore true, specialFolderPath("documents") & "/mqtt"
 ```
@@ -402,10 +406,14 @@ payloads** and **unsubscribe** to the observed list. It also found the
 conformance test asserting the QoS 2 acknowledgment leg one line too early —
 the library was right.
 
-**Still unproven:** the 200 KB re-run against the mosquitto that originally
-failed (a different broker from the one that passed), auto-reconnect after a
-broker restart, multi-connection, persistent store, and TLS. The performance
-figures below are from 2.11.x and have not been re-measured.
+Runs three and four, back on the mosquitto that first failed, confirmed the
+diagnosis and located the cause: a synchronous write that exceeds the kernel's
+send buffer silently drops its tail. 2.12.3 chunks every write; the 1 MB rung of
+the conformance ladder is the test of that fix and has not yet run.
+
+**Still unproven:** the chunked write itself (the 1 MB rung), auto-reconnect
+after a broker restart, multi-connection, persistent store, and TLS. The
+performance figures below are from 2.11.x and have not been re-measured.
 
 ## Performance
 
@@ -476,7 +484,31 @@ MQTT 3.1.1 Specification Implementation:
 
 ## Version History
 
-### 2.12.2 (Current)
+### 2.12.3 (Current)
+
+The write path, settled by the fourth engine run and an independent analysis of
+all four. See `docs/ENGINE-NOTES.md` 1.1 for the evidence.
+
+- **Every socket write is now chunked.** The engine's synchronous write makes
+  one `send()`: what fits in the kernel's TCP send buffer is accepted in memcpy
+  time, and what does not fit is silently dropped when the wait times out. The
+  buffer is autotuned, so **no single write size is safe on a cold connection**.
+  `__writeSocket` now hands the kernel at most `mqttSetWriteChunkSize` bytes per
+  write (default 16 KB), and a failure reports how far it got: `timeout after
+  131072 of 204800 bytes`.
+- **The conformance ladder runs to 1 MB.** That rung is the experiment: it
+  round-trips only if the chunked write is doing its job, and a chunk that still
+  blocks would mean the diagnosis is wrong.
+- **Asynchronous writes were considered and rejected**, for now: the engine
+  discards queued writes on `close socket`, and both disconnect paths write
+  DISCONNECT then close, so every clean disconnect would have published the
+  Last Will. Recorded in the notes with the fallback conditions.
+- **A related hazard is recorded, not fixed** (notes 1.4): with unread inbound
+  data pending at `close`, the DISCONNECT may be lost to an RST and the broker
+  fires the Will on a clean exit. Inferred, unobserved, and it names the test
+  that would settle it.
+
+### 2.12.2
 
 One change, from the third engine run of the day (mosquitto on a LAN):
 
